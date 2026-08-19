@@ -1,4 +1,4 @@
-# RedAgent Engagement Report — <name>
+# ShardReaper Engagement Report — <name>
 
 - **Created:** <ts>  **Updated:** <ts>
 - **Phase:** <phase>

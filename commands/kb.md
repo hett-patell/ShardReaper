@@ -6,7 +6,7 @@ description: Search the local offensive corpus (Atomic Red Team, HackTricks 916 
 # /kb — knowledge base
 
 The corpus is the weapon library. Consult it before every technique decision —
-it indexes the full reference tree that ships beside RedAgent.
+it indexes the full reference tree that ships beside ShardReaper.
 
 ## Usage
 
@@ -20,10 +20,10 @@ it indexes the full reference tree that ships beside RedAgent.
 ## Under the hood
 
 ```
-redagent kb <query> [--limit N] [--corpus <hacktricks|ired|bughunter>]
-redagent kb-open <query>          # exact path of the best hit
-redagent atomic list --search <q> # executable tests for the technique
-redagent weapons <query>          # the tool that does it
+shardreaper kb <query> [--limit N] [--corpus <hacktricks|ired|bughunter>]
+shardreaper kb-open <query>          # exact path of the best hit
+shardreaper atomic list --search <q> # executable tests for the technique
+shardreaper weapons <query>          # the tool that does it
 ```
 
 ## Rules

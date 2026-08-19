@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2025 RedAgent
+Copyright (c) 2025 ShardReaper
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,6 @@ SOFTWARE.
 This project aggregates technique indexes and pointers into publicly available
 offensive-security reference corpora (Atomic Red Team, HackTricks skills,
 ired.team notes, Claude-BugHunter, RedTeam-Tools, Red-Teaming-Toolkit,
-Awesome-Red-Teaming). Those corpora retain their own licenses; RedAgent only
-reads them locally and does not redistribute their content. Use RedAgent only
+Awesome-Red-Teaming). Those corpora retain their own licenses; ShardReaper only
+reads them locally and does not redistribute their content. Use ShardReaper only
 against systems you own or are contractually authorized to test.

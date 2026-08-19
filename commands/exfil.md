@@ -11,10 +11,10 @@ survives — and keep the network in your hand while you do.
 ## What it does
 
 ```
-redagent run eng --phases evade      # AMSI/ETW bypass, obfuscation, log hygiene
-redagent run eng --phases exfil      # collection + exfiltration channel selection
-redagent report eng                  # render REPORT.md (chains + evidence)
-redagent status eng                  # live state: findings, actions, plan
+shardreaper run eng --phases evade      # AMSI/ETW bypass, obfuscation, log hygiene
+shardreaper run eng --phases exfil      # collection + exfiltration channel selection
+shardreaper report eng                  # render REPORT.md (chains + evidence)
+shardreaper status eng                  # live state: findings, actions, plan
 ```
 
 ## Exfiltration channels (pick by egress)

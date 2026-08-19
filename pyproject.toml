@@ -3,13 +3,13 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "redagent"
+name = "shardreaper"
 version = "1.0.0"
-description = "RedAgent — a complete, aggressive autonomous red team agent. Engages targets, routes the local offensive corpus (Atomic Red Team, HackTricks, ired.team, BugHunter, tool catalogs), runs recon, executes techniques, and produces operator-ready reports."
+description = "ShardReaper — a complete, aggressive autonomous red team agent. Engages targets, routes the local offensive corpus (Atomic Red Team, HackTricks, ired.team, BugHunter, tool catalogs), runs recon, executes techniques, and produces operator-ready reports."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "RedAgent" }]
+authors = [{ name = "ShardReaper" }]
 keywords = ["red-team", "offensive-security", "pentest", "att&ck", "agent", "adversary-simulation"]
 dependencies = []
 
@@ -19,10 +19,10 @@ http = ["requests"]
 yaml = ["PyYAML"]
 
 [project.scripts]
-redagent = "redagent.cli:main"
+shardreaper = "shardreaper.cli:main"
 
 [tool.setuptools]
-packages = ["redagent"]
+packages = ["shardreaper"]
 
 [tool.setuptools.package-data]
-redagent = ["data/*.json", "data/wordlists/*.txt"]
+shardreaper = ["data/*.json", "data/wordlists/*.txt"]

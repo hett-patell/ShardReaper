@@ -11,8 +11,8 @@ it to spread everywhere.
 ## What it does
 
 ```
-redagent run eng --phases harvest    # lsass, SAM, tickets, stores, configs, cloud
-redagent run eng --phases move       # SMB/WinRM/RDP/SSH, pass-the-hash, pivots
+shardreaper run eng --phases harvest    # lsass, SAM, tickets, stores, configs, cloud
+shardreaper run eng --phases move       # SMB/WinRM/RDP/SSH, pass-the-hash, pivots
 ```
 
 ## Harvest order

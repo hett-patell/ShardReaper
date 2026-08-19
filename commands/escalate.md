@@ -14,8 +14,8 @@ Pulls the corpus playbooks (HackTricks + ired.team), selects the Atomic rack
 tests, and lists the weapons for both phases:
 
 ```
-redagent run eng --phases escalate     # privesc: sudo/setuid, tokens, services, kernel
-redagent run eng --phases persist      # persistence: cron/systemd/registry/tasks/WMI
+shardreaper run eng --phases escalate     # privesc: sudo/setuid, tokens, services, kernel
+shardreaper run eng --phases persist      # persistence: cron/systemd/registry/tasks/WMI
 ```
 
 ## Chain

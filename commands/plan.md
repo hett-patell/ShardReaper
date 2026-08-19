@@ -7,7 +7,7 @@ description: Rank recon intel into an attack plan — findings first, services n
 
 Turn intel into fire orders. The engine ranks every finding and open service
 by severity and attaches the matching technique + Atomic Red Team tests. With
-a brain configured (`REDAGENT_LLM_*`) it also ranks full attack chains.
+a brain configured (`SHARDREAPER_LLM_*`) it also ranks full attack chains.
 
 ## What it produces
 
@@ -21,7 +21,7 @@ a brain configured (`REDAGENT_LLM_*`) it also ranks full attack chains.
 
 ```
 /plan eng
-redagent run eng --phases plan
+shardreaper run eng --phases plan
 ```
 
 ## Rules

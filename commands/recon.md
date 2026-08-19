@@ -20,7 +20,7 @@ ever contacted without passing the scope gate first.
 
 ```
 /recon eng
-/redagent recon --host 10.0.0.5 --in-scope 10.0.0.0/24   # ad-hoc single host
+/shardreaper recon --host 10.0.0.5 --in-scope 10.0.0.0/24   # ad-hoc single host
 ```
 
 Every discovery lands in `state.json` + the ledger. Exposed sensitive files

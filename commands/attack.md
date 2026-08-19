@@ -14,8 +14,8 @@ captured as evidence.
 ```
 /attack eng                    # dry-run: renders every command, touches nothing
 /attack eng --go               # execute (operator-authorized)
-redagent atomic select --technique T1003
-redagent atomic run --technique T1003 --index 0 --go
+shardreaper atomic select --technique T1003
+shardreaper atomic run --technique T1003 --index 0 --go
 ```
 
 ## Rules
