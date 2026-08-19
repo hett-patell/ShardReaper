@@ -1,7 +1,7 @@
 <img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/3b88ec4f-655f-45bf-b5d8-9974c4f7ef93" />
 
 
-# shardreaper
+# ShardReaper
 
 > A self-contained, autonomous red team operator · **12-phase kill chain** · **1,819 executable ATT&CK tests** · **2,700+ technique playbooks & payload scripts** in an offline knowledge base · **700+ weapon & resource catalog** · deterministic scope gate · cross-engagement memory with resume · platform reports (HackerOne / Bugcrowd / Intigriti) · 7-Question triage gate + full validation · exploit-chain builder · passive OSINT · web3 rug-pull audit · ATT&CK Navigator export · SQLi oracle + encoded exfil · file fuzzing · pure-python crackers · arsenal self-check · canary listener · transport healthcheck · adaptive scan pacing · optional LLM brain · zero runtime dependencies. One shard. Sharpest edge. Total harvest.
 
