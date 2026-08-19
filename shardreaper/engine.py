@@ -316,7 +316,24 @@ class Engine:
                 self.phase_tactical(phase, phase)
             else:
                 self.eng.log(f"unknown phase {phase}", "err")
+            self._checkpoint(phase)
         self.eng.log("engine complete")
+
+    def _checkpoint(self, phase):
+        """Post-Cobblestone lesson 10: checkpoint the ledger after every phase."""
+        try:
+            from . import memory
+            proven = [{"id": f["id"], "severity": f.get("severity"),
+                       "title": f.get("title", "")[:80]}
+                      for f in self.eng.state.get("findings", [])]
+            ruled = sorted({a.get("technique") for a in self.eng.state.get("actions", [])
+                            if a.get("outcome") in ("dry-run", "planned", "failed")})
+            memory.checkpoint(self.eng.state.get("name", "engagement"), phase,
+                              proven, ruled,
+                              open_items=[p.get("action") for p in
+                                          self.eng.state.get("plan", [])][:12])
+        except Exception:
+            pass
 
 
 def engage(base, name, seeds, in_scope, out_of_scope, objective="", mock=False):
@@ -341,6 +358,20 @@ def engage(base, name, seeds, in_scope, out_of_scope, objective="", mock=False):
     for seed in seeds or []:
         if not scope.in_scope_host(seed):
             eng.log(f"WARNING: seed {seed} is OUT of scope — recon will skip it", "warn")
+    # post-Cobblestone lesson 7: prove the local arsenal works before the run
+    if not os.environ.get("SHARDREAPER_SKIP_ENVCHECK"):
+        try:
+            from .envcheck import arsenal_report, format_report
+            report = arsenal_report(base=base)
+            eng.state["notes"].append({"ts": eng.state["updated"],
+                                       "kind": "arsenal", "data": report})
+            eng.save()
+            eng.log(f"arsenal self-check: {len(report['ok_tools'])} working / "
+                    f"{len(report['dead_tools'])} dead tools — "
+                    f"{'hashcat usable' if report['hashcat_opencl']['opencl'] else 'hashcat DEAD (use shardreaper crack)'}",
+                    "warn" if report["dead_tools"] else "info")
+        except Exception:
+            pass
     print()
     print(scope.describe())
     return base

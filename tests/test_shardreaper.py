@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # keep the memory ledger hermetic during tests
 os.environ.setdefault("SHARDREAPER_MEMORY_DIR",
                       tempfile.mkdtemp(prefix="shardreaper-mem-test-"))
+os.environ.setdefault("SHARDREAPER_SKIP_ENVCHECK", "1")  # no tool probes in tests
 
 from shardreaper.scope import Scope, OutOfScopeError
 from shardreaper.state import Engagement
@@ -630,6 +631,135 @@ def test_hunt_scaffold():
         assert os.path.isdir(os.path.join(base, "findings"))
         assert os.path.isdir(os.path.join(base, "evidence"))
         assert os.path.isfile(os.path.join(base, "state.json"))
+
+
+
+# ---------------- post-Cobblestone hardening ----------------
+def _fake_oracle_probe(secret="hunter2"):
+    import re as _re
+    def probe(cond):
+        m = _re.match(r"ASCII\(SUBSTRING\(\(SECRET\),(\d+),1\)\)>(\d+)", cond)
+        if m:
+            return ord(secret[int(m.group(1)) - 1]) > int(m.group(2))
+        m = _re.match(r"LENGTH\(\(SECRET\)\)<=(\d+)", cond)
+        if m:
+            return len(secret) <= int(m.group(1))
+        return cond == "1=1"
+    return probe
+
+
+def test_sqli_variants():
+    from shardreaper.sqli import variants
+    vs = variants("-1")
+    assert "-1" in vs and -1 in vs
+    vs2 = variants(0)
+    assert 0 in vs2 and "0" in vs2
+
+
+def test_sqli_oracle_validate_and_extract():
+    from shardreaper.sqli import Oracle
+    oracle = Oracle(_fake_oracle_probe())
+    v = oracle.validate()
+    assert v["ok"] and v["true_cond_evaluates"] and not v["false_cond_evaluates"]
+    assert oracle.extract_string("SECRET") == "hunter2"
+    # a broken oracle must be detected, not silently trusted
+    broken = Oracle(lambda cond: True)
+    assert not broken.validate()["ok"]
+
+
+def test_sqli_file_read_encoded():
+    from shardreaper.sqli import file_read_payload, decode_exfil
+    p = file_read_payload("mysql", "/etc/passwd")
+    assert "TO_BASE64" in p and "LOAD_FILE" in p
+    p2 = file_read_payload("mysql", "/etc/passwd", encoding="hex")
+    assert "HEX(LOAD_FILE" in p2
+    assert "pg_read_file" in file_read_payload("postgres", "/etc/passwd")
+    # decode roundtrip
+    import base64
+    blob = base64.b64encode(b"root:x:0:0:root:/root:/bin/bash").decode()
+    raw, how = decode_exfil("<div>" + blob + "</div>")
+    assert raw.startswith(b"root:x:") and how == "base64"
+
+
+def test_fuzz():
+    from shardreaper.fuzz import harvest_refs, fuzz_paths
+    refs = harvest_refs('<script src="/static/app.js"></script>'
+                        '<?php include "skins.php"; ?>'
+                        '<a href="admin.php">x</a>')
+    assert "static/app.js" in refs or "skins.php" in refs or "admin.php" in refs
+    found = fuzz_paths(lambda c: "content" if c.endswith("skins.php") else None,
+                       ["index.php", "skins.php", "admin.php"], "/var/www/html")
+    assert len(found) == 1 and found[0]["path"].endswith("skins.php")
+
+
+def test_crack_ground_truth():
+    from shardreaper.crack import verify, identify
+    vectors = [
+        ("secret", "$1$deadbeef$ybdbWGoRB3GJ6nEVnhq7O0"),
+        ("secret", "$5$saltsalt$0IyaXrmV7.sGNS6tirgqHLqX/G.FBvgkYA.lpPdS5sA"),
+        ("secret", "$6$saltsalt$TVLlQcbpFVof5W3Yz4DTP6gRstiNuHwwTt6GLc1E5n0U0aDehy0S5knV8wiOQSpT0Y77vwPZN.Pq.H91p5hVO1"),
+        ("password123", "$5$rounds=1000$someval$5eCN1JFu72ZTrJI42vMI46knJHTfjz8CyI0eJtn5Ir/"),
+    ]
+    for pw, h in vectors:
+        assert verify(pw, h), f"failed {h[:12]}"
+        assert not verify("wrong", h)
+    assert identify(vectors[0][1]) == "md5crypt"
+    assert identify(vectors[1][1]) == "sha256crypt"
+    assert identify(vectors[2][1]) == "sha512crypt"
+
+
+def test_crack_wordlist():
+    from shardreaper.crack import crack
+    with tempfile.TemporaryDirectory() as d:
+        wl = os.path.join(d, "wl.txt")
+        open(wl, "w").write("password\npassword123\nadmin\n")
+        pw, rule = crack("$5$rounds=1000$someval$5eCN1JFu72ZTrJI42vMI46knJHTfjz8CyI0eJtn5Ir/",
+                         wl, rules=("", "c"))
+        assert pw == "password123"
+        pw2, _ = crack("$1$deadbeef$ybdbWGoRB3GJ6nEVnhq7O0", wl)
+        assert pw2 is None
+
+
+def test_envcheck():
+    from shardreaper.envcheck import probe_tool, writable_dirs, format_report, arsenal_report
+    r = probe_tool("definitely-not-a-real-tool-xyz", ["--version"])
+    assert r["status"] == "missing"
+    assert arsenal_report()["fallbacks"]["pure-crack"].startswith("ok")
+    assert "writable" in writable_dirs([("tmp", tempfile.mkdtemp())])["tmp"]
+    assert "hashcat" in format_report(arsenal_report())
+
+
+def test_canary_url():
+    from shardreaper.canary import canary_url
+    u = canary_url("10.0.0.5", 8888, "tok123")
+    assert u == "http://10.0.0.5:8888/tok123"
+
+
+def test_transport_healthcheck():
+    from shardreaper.transport import healthcheck, format_health
+    r = healthcheck()
+    for key in ("vpn_processes", "tun_present", "gateway", "dns"):
+        assert key in r
+    assert "TRANSPORT SELF-CHECK" in format_health(r)
+
+
+def test_adaptive_policy():
+    from shardreaper.recon import adaptive_policy
+    assert adaptive_policy(50, 100, 0)["ban"] is False
+    p = adaptive_policy(30, 100, 1)
+    assert p["pause"] > 0 and p["timeout"] > 3.0
+    assert adaptive_policy(2, 100, 2)["ban"] is True
+    # small scans never ban
+    assert adaptive_policy(0, 10, 3)["ban"] is False
+
+
+def test_memory_checkpoint():
+    from shardreaper import memory
+    memory.checkpoint("eng-ckpt", "attack",
+                      [{"id": "F001", "severity": "high", "title": "x"}],
+                      ["T1059"], ["deep-web-audit"])
+    roll = memory._rollup("_engagement_eng-ckpt")
+    assert roll["checkpoints"][-1]["phase"] == "attack"
 
 if __name__ == "__main__":
     import traceback

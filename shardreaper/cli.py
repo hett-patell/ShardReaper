@@ -66,6 +66,12 @@ def main(argv=None):
     from . import osint as osintmod
     from . import tokens as tokensmod
     from . import analysis as analysismod
+    from . import sqli as sqlimod
+    from . import fuzz as fuzzmod
+    from . import crack as crackmod
+    from . import envcheck as envcheckmod
+    from . import canary as canarymod
+    from . import transport as transportmod
 
     engine.build_arg_parser(sub)
     reportmod.build_arg_parser(sub)
@@ -76,6 +82,12 @@ def main(argv=None):
     osintmod.build_arg_parser(sub)
     tokensmod.build_arg_parser(sub)
     analysismod.build_arg_parser(sub)
+    sqlimod.build_arg_parser(sub)
+    fuzzmod.build_arg_parser(sub)
+    crackmod.build_arg_parser(sub)
+    envcheckmod.build_arg_parser(sub)
+    canarymod.build_arg_parser(sub)
+    transportmod.build_arg_parser(sub)
 
     kb = sub.add_parser("kb", help="search the local offensive corpus")
     kb.add_argument("query", nargs="+")

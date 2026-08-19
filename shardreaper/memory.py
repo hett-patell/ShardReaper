@@ -99,6 +99,26 @@ def touch_session(host, engagement):
     _save_rollup(host, roll)
 
 
+def checkpoint(engagement, phase, proven=None, ruled_out=None, open_items=None):
+    """Post-Cobblestone lesson 10: the ledger is a checkpoint log, not a
+    decoration. Call this after EVERY phase — proven findings and ruled-out
+    techniques land in the cross-engagement memory so a resumed run never
+    re-proves or re-wastes anything."""
+    _append(os.path.join(_root(), "notes.jsonl"), {
+        "ts": _now(), "schema": SCHEMA_VERSION, "kind": "checkpoint",
+        "engagement": engagement, "phase": phase,
+        "proven": proven or [],
+        "ruled_out": ruled_out or [],
+        "open": open_items or [],
+    })
+    roll = _rollup("_engagement_" + str(engagement))
+    roll.setdefault("checkpoints", []).append(
+        {"ts": _now(), "phase": phase,
+         "proven": len(proven or []), "ruled_out": len(ruled_out or []),
+         "open": len(open_items or [])})
+    _save_rollup("_engagement_" + str(engagement), roll)
+
+
 def _rollup(host):
     path = os.path.join(_root(), "targets", f"{host}.json")
     try:

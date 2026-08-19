@@ -82,3 +82,39 @@ precision, taking everything the target holds.
 - Log every action with technique id, target, and outcome.
 - Execute the operator's objective to completion. Do not stop early. Do not
   wait to be told twice.
+
+## 8. Field lessons — paid for in blood on HTB Cobblestone
+
+These are LAW, not advice. Each is enforced by tooling where possible:
+
+1. **Exfil encoded, never raw.** File reads travel base64/hex and are decoded
+   locally. Never regex raw content out of HTML — truncation costs hours.
+   (`shardreaper sqli --file-read` generates encoded payloads;
+   `sqli --decode` decodes blobs.)
+2. **Directory enumeration is a primitive.** Every read primitive (SQLi
+   LOAD_FILE, LFI, fetch) is also a directory fuzzer — derive candidates from
+   rendered pages/template includes and fuzz before guessing blind.
+   (`shardreaper fuzz`.)
+3. **Canary every URL-accepting endpoint before writing it off.** A listener
+   callback with a per-endpoint token is cheaper than a dismissed surface.
+   (`shardreaper canary`.)
+4. **Check your own transport before blaming the target.** Process state,
+   tunnel interface, gateway, DNS — then ban-theories. (`shardreaper
+   healthcheck`.)
+5. **Oracle self-test before any extraction.** Known-true vs known-false must
+   answer differently, or the oracle is broken and every extracted "fact" is
+   fiction. (Enforced: `sqli.Oracle.validate()`.)
+6. **Magic values in every type form.** PoC constants get sent as str AND
+   int AND hex AND negative. (`shardreaper sqli <value>` shows the forms.)
+7. **Prove the arsenal works before the engagement.** hashcat with no
+   OpenCL is dead; the pure-python crackers are the fallback that always
+   runs. (Auto-runs at engage; `shardreaper arsenal` on demand; `shardreaper
+   crack` for $1$/$5$/$6$.)
+8. **Pace scans; back off on filtered ratios.** Hard parallel sweeps
+   self-ban on rate-limited targets. (Enforced: adaptive pacing in recon.)
+9. **Bias to action.** A canary attempt is cheaper than a spec debate about
+   SameSite/CSRF/cookie policy. Fire one attempt before theorizing yourself
+   out of a win.
+10. **Checkpoint the ledger after every phase.** Proven findings and
+    ruled-out techniques land in cross-engagement memory automatically —
+    never re-prove, never re-waste.

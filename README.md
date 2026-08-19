@@ -3,7 +3,7 @@
 
 # shardreaper
 
-> A self-contained, autonomous red team operator · **12-phase kill chain** · **1,819 executable ATT&CK tests** · **2,700+ technique playbooks & payload scripts** in an offline knowledge base · **700+ weapon & resource catalog** · deterministic scope gate · cross-engagement memory with resume · platform reports (HackerOne / Bugcrowd / Intigriti) · 7-Question triage gate + full validation · exploit-chain builder · passive OSINT · web3 rug-pull audit · ATT&CK Navigator export · optional LLM brain · zero runtime dependencies. One shard. Sharpest edge. Total harvest.
+> A self-contained, autonomous red team operator · **12-phase kill chain** · **1,819 executable ATT&CK tests** · **2,700+ technique playbooks & payload scripts** in an offline knowledge base · **700+ weapon & resource catalog** · deterministic scope gate · cross-engagement memory with resume · platform reports (HackerOne / Bugcrowd / Intigriti) · 7-Question triage gate + full validation · exploit-chain builder · passive OSINT · web3 rug-pull audit · ATT&CK Navigator export · SQLi oracle + encoded exfil · file fuzzing · pure-python crackers · arsenal self-check · canary listener · transport healthcheck · adaptive scan pacing · optional LLM brain · zero runtime dependencies. One shard. Sharpest edge. Total harvest.
 
 ---
 
@@ -96,6 +96,24 @@ Beyond the kill chain, ShardReaper carries the full operator toolkit:
 - **Web3 audit** — `token-scan` catches the rug vectors (hidden mint, honeypot, fee manipulation, fake renounce, proxies, reentrancy, Solana authorities); the `shardreaper-web3` skill covers economics and access control.
 - **Burp integration** — set `SHARDREAPER_PROXY=http://127.0.0.1:8080` and every request flows through your intercepting proxy (CONNECT tunnel for HTTPS); a Burp MCP config template ships in `templates/`.
 
+## Field lessons — hardened on HTB Cobblestone
+
+ShardReaper failed its first real machine, took the writeup, and turned every
+failure into code. The ten lessons are now LAW (see `AGENTS.md` §8):
+
+| # | Lesson | Enforced by |
+|---|---|---|
+| 1 | Exfil encoded, never raw regex off HTML | `sqli --file-read` generates base64/hex payloads; `sqli --decode` decodes locally |
+| 2 | Every read primitive is a directory fuzzer | `fuzz` — harvest refs from rendered pages, feed candidates through your working exfil one-liner |
+| 3 | Canary every URL-accepting endpoint before writing it off | `canary` — tokenized listener, loud token hits, JSONL log |
+| 4 | Check your own transport before ban theories | `healthcheck` — vpn processes, tunnel, gateway TCP, DNS verdict |
+| 5 | Oracle self-test before any extraction | `sqli.Oracle.validate()` — known-true vs known-false, refuses broken oracles |
+| 6 | Magic values in every type form | `sqli <value>` — str/int/hex/negative variants |
+| 7 | Prove the arsenal works before the engagement | `arsenal` — runs at every `engage`; `crack` is the pure-python fallback ($1$/$5$/$6$ + raw, ground-truthed against system crypt) |
+| 8 | Pace scans; back off on filtered ratios | adaptive pacing in `recon` — pause/backoff/stop on answer-ratio collapse |
+| 9 | Bias to action | doctrine — a canary is cheaper than a spec debate |
+| 10 | Checkpoint the ledger after every phase | automatic in `engine.run()` — proven/ruled-out land in cross-engagement memory |
+
 ---
 
 ## How it works
@@ -153,11 +171,11 @@ for the full posture.
 | Kill-chain phases | 8 | `shardreaper-recon` · `-attack` · `-persist` · `-privesc` · `-credharvest` · `-lateral` · `-evasion` · `-exfil-c2` |
 | Operator layer | 3 | `shardreaper-osint` · `shardreaper-report` · `shardreaper-web3` |
 
-**26 slash commands**: `engage`, `hunt`, `scope`, `recon`, `kb`, `classify`,
+**32 slash commands**: `engage`, `hunt`, `scope`, `recon`, `kb`, `classify`,
 `plan`, `attack`, `escalate`, `harvest`, `exfil`, `report`, `autopilot`,
 `pickup`, `remember`, `memory-gc`, `triage`, `validate`, `chain`, `surface`,
-`intel`, `map`, `osint`, `token-scan`, `web3-audit`, `status` — one per
-operator move.
+`intel`, `map`, `osint`, `token-scan`, `web3-audit`, `status`, `sqli`, `fuzz`,
+`crack`, `arsenal`, `canary`, `healthcheck` — one per operator move.
 
 **The engine** — deterministic, resumable, auditable:
 
@@ -189,7 +207,7 @@ operator move.
 | [`commands/`](commands/) | 25 slash commands |
 | [`skills/`](skills/) | 12 phase skills in SKILL.md format |
 | [`templates/`](templates/) | Engagement + report templates, Burp MCP config example |
-| [`tests/`](tests/) | 45 self-tests, all green |
+| [`tests/`](tests/) | 56 self-tests, all green |
 | [`SECURITY.md`](SECURITY.md) | Authorized-use posture |
 | [`LICENSE`](LICENSE) | MIT |
 
@@ -226,6 +244,7 @@ it. The reaper harvests what remains after.
 - [x] Web3 rug-pull audit (token-scan + audit skill)
 - [x] Full reference integration — 2,760-doc knowledge base, 709-entry catalog with install blocks, payload scripts, reversing/lab notes
 - [x] Hunt scaffold (scope.md + workspace) · ATT&CK Navigator export · report redaction
+- [x] Field-lesson hardening (HTB Cobblestone): encoded exfil, file fuzzing, canary listener, transport healthcheck, SQLi oracle self-test, magic variants, arsenal self-check, pure-python crackers, adaptive scan pacing, per-phase ledger checkpoints
 - [ ] Built-in HTTP exploitation primitives (auth-bypass checks, verb tampering)
 - [ ] C2 module (implant wrappers, DNS channel templates)
 - [ ] AD attack-path planning with graph collection

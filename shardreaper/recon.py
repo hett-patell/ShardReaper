@@ -17,6 +17,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
@@ -151,24 +152,67 @@ class Recon:
         return None
 
     # ---------------- ports ----------------
-    def port_scan(self, host, ports=None, top=100):
+    def port_scan(self, host, ports=None, top=100, adaptive=True, chunk=256):
+        """TCP connect sweep with adaptive pacing (post-Cobblestone lesson 8).
+
+        A hard parallel sweep can trip rate filters and self-ban. Chunks the
+        port list and reacts to the answered-vs-dropped ratio: pause, extend
+        timeouts, and stop outright when the target goes dark.
+        """
         ports = ports or DEFAULT_PORTS[:top]
         open_ports = {}
-        def probe(port):
-            if not self.scope.in_scope(host, port=port):
-                return None
-            try:
-                with socket.create_connection((host, port), timeout=self.timeout):
-                    return port, self._banner(host, port)
-            except OSError:
-                return None
-        with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            futs = [ex.submit(probe, p) for p in ports]
-            for fut in as_completed(futs):
-                r = fut.result()
-                if r:
-                    open_ports[r[0]] = r[1]
+        self.last_scan_meta = {"ban": False, "ratio": 1.0, "chunks": 0}
+        chunks = [ports[i:i + chunk] for i in range(0, len(ports), chunk)]
+        for idx, pc in enumerate(chunks):
+            with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                futs = {ex.submit(self._probe_port, host, p): p for p in pc}
+                answered = 0
+                for fut in as_completed(futs):
+                    r = fut.result()
+                    if r:
+                        answered += 1
+                        open_ports[r[0]] = r[1]
+            self.last_scan_meta["chunks"] = idx + 1
+            if len(pc):
+                self.last_scan_meta["ratio"] = answered / len(pc)
+            policy = adaptive_policy(answered, len(pc), idx)
+            self.last_scan_meta.update(policy)
+            if policy["ban"]:
+                self.last_scan_meta["ban"] = True
+                self.log(f"port_scan {host}: {answered}/{len(pc)} answered — "
+                         f"target likely FILTERING (ratio "
+                         f"{self.last_scan_meta['ratio']:.2f}). Stopping the sweep; "
+                         f"pace later or switch to passive sources.", "warn")
+                break
+            if policy["pause"]:
+                self.log(f"port_scan {host}: low answer ratio "
+                         f"({self.last_scan_meta['ratio']:.2f}) — backing off "
+                         f"{policy['pause']}s, timeout->{policy['timeout']}s", "warn")
+                time.sleep(policy["pause"])
+            self.timeout = policy["timeout"]
         return dict(sorted(open_ports.items()))
+
+    def _probe_port(self, host, port):
+        if not self.scope.in_scope(host, port=port):
+            return None
+        try:
+            with socket.create_connection((host, port), timeout=self.timeout):
+                return port, self._banner(host, port)
+        except OSError:
+            return None
+
+
+def adaptive_policy(answered, total, chunk_idx):
+    """Decision table for scan pacing — pure function, unit-tested."""
+    if total < 20:
+        return {"pause": 0, "timeout": 3.0, "ban": False}
+    ratio = answered / total
+    if ratio >= 0.5:
+        return {"pause": 0, "timeout": 3.0, "ban": False}
+    if ratio < 0.05 and chunk_idx >= 1:
+        return {"pause": 0, "timeout": 3.0, "ban": True}
+    return {"pause": 5.0, "timeout": min(3.0 + 3.0 * chunk_idx, 15.0),
+            "ban": False}
 
     def _banner(self, host, port):
         try:
