@@ -11,6 +11,7 @@ Technique index: atomics/<T>/<T>.yaml — each holds `atomic_tests[]` with
 `executor.command` (and optional cleanup_command), input_arguments with
 defaults, supported_platforms, and dependency checks.
 """
+import json
 import os
 import re
 import subprocess
@@ -333,6 +334,68 @@ def _default_root():
         "atomic-red-team"))
 
 
+def build_navigator_layer(eng, title=None):
+    """ATT&CK Navigator layer from an engagement: planned + executed techniques."""
+    from collections import Counter
+    counts = Counter()
+    for a in eng.state.get("actions", []):
+        tid = str(a.get("technique", ""))
+        m = re.match(r"^(T\d{4}(?:\.\d{3})?)", tid)
+        if m:
+            counts[m.group(1)] += 1
+    for p in eng.state.get("plan", []):
+        tid = str(p.get("technique", ""))
+        m = re.match(r"^(T\d{4}(?:\.\d{3})?)", tid)
+        if m:
+            counts.setdefault(m.group(1), 0)
+    techniques = []
+    for tid, n in sorted(counts.items()):
+        techniques.append({
+            "techniqueID": tid,
+            "score": min(n or 1, 10),
+            "comment": f"ShardReaper: {n} action(s)" if n else "ShardReaper: planned",
+            "enabled": True,
+        })
+    return {
+        "name": title or f"ShardReaper — {eng.state.get('name', 'engagement')}",
+        "versions": {"attack": "18", "navigator": "5.3.0", "layer": "4.5"},
+        "description": "Techniques planned/executed by ShardReaper during this engagement.",
+        "domain": "enterprise-attack",
+        "filters": {"platforms": ["Windows", "Linux", "macOS"]},
+        "gradient": {"colors": ["#ffffff", "#ce232e"], "minValue": 0, "maxValue": 10},
+        "legendItems": [
+            {"label": "executed", "color": "#ce232e"},
+            {"label": "planned", "color": "#f7b267"}],
+        "techniques": techniques,
+    }
+
+
+def cli_navigator(args):
+    if args.list:
+        bundled = os.path.join(_default_root(), "atomics", "Indexes",
+                               "Attack-Navigator-Layers")
+        if os.path.isdir(bundled):
+            print("bundled platform layers:")
+            for f in sorted(os.listdir(bundled)):
+                print(f"  {f}")
+        else:
+            print("no bundled layers found")
+        return 0
+    from .state import Engagement
+    base = os.path.abspath(args.dir)
+    if not os.path.isfile(os.path.join(base, "state.json")):
+        print(f"no engagement at {base}")
+        return 1
+    eng = Engagement.load(base)
+    layer = build_navigator_layer(eng)
+    out = os.path.join(base, "navigator-layer.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(layer, f, indent=1)
+    print(f"navigator layer written: {out} ({len(layer['techniques'])} technique(s)) "
+          f"— upload to https://mitre-attack.github.io/attack-navigator/")
+    return 0
+
+
 def build_arg_parser(sub):
     p = sub.add_parser("atomic", help="Atomic Red Team weapons rack")
     subp = p.add_subparsers(dest="cmd", required=True)
@@ -359,4 +422,8 @@ def build_arg_parser(sub):
     rp.add_argument("--cleanup", action="store_true", help="render/run cleanup command")
     rp.add_argument("--timeout", type=int, default=120)
     rp.set_defaults(fn=cli_run)
+    np_ = subp.add_parser("navigator", help="ATT&CK Navigator layer from an engagement")
+    np_.add_argument("dir", nargs="?", default=None, help="engagement folder")
+    np_.add_argument("--list", action="store_true", help="list bundled platform layers")
+    np_.set_defaults(fn=cli_navigator)
     return p

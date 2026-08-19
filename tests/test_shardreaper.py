@@ -535,6 +535,102 @@ def test_osint_expansion_patched():
     assert "admin.example.com" not in live   # out-of-scope rule wins
     assert "evil.net.example.com" not in live  # no DNS
 
+
+
+# ---------------- ultimate pass: awesome catalog, scope.md, navigator, validate, classify, redact, hunt ----------------
+def test_awesome_weapons_parse():
+    from shardreaper.weapons import _parse_awesome
+    roots = corpus_roots()
+    if "awesome" not in roots:
+        return
+    entries = _parse_awesome(roots["awesome"])
+    assert len(entries) > 250
+    assert any(e["phase"] == "initial-access" for e in entries)
+    assert any("uac" in e["name"].lower() for e in entries)
+
+
+def test_weapons_install_blocks():
+    from shardreaper.weapons import _parse_rtt
+    roots = corpus_roots()
+    if "redteam-tools" not in roots:
+        return
+    entries = _parse_rtt(roots["redteam-tools"])
+    with_install = [e for e in entries if e.get("install")]
+    assert with_install, "install blocks should be captured"
+
+
+def test_scope_md_load():
+    from shardreaper.scope import Scope
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "scope.md")
+        open(p, "w").write(
+            "# Scope — demo\n## In scope\n* example.com\n* 10.0.0.0/8\n"
+            "## Out of scope\n* admin.example.com\n## Seeds\n* http://api.example.com\n")
+        s = Scope.load_md(p)
+    assert s.in_scope_host("api.example.com")
+    assert not s.in_scope_host("admin.example.com")
+    assert s.in_scope_host("10.1.2.3")
+    assert s.seeds == ["http://api.example.com"]
+
+
+def test_navigator_layer():
+    from shardreaper.atomics import build_navigator_layer
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engagement(d, "t1")
+        eng.log_action("T1003.001", "h1", "lsass dump", outcome="executed")
+        eng.state["plan"] = [{"technique": "T1595.003 Wordlist Scanning"}]
+        layer = build_navigator_layer(eng)
+    tids = [t["techniqueID"] for t in layer["techniques"]]
+    assert "T1003.001" in tids and "T1595.003" in tids
+    assert layer["domain"] == "enterprise-attack"
+
+
+def test_validate_command():
+    from shardreaper.analysis import validate, ALWAYS_REJECTED
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engagement(d, "t1")
+        eng.add_finding("self-XSS on profile", "low", "self-xss", "T1059.007",
+                        "t", [], "d")
+        results = validate(eng, assume_yes=True)
+        assert results[0][1]["decision"] == "kill"     # always-rejected class
+        eng.add_finding("IDOR real", "high", "idor", "T1005", "t", ["ev"], "d")
+        results = validate(eng, finding_ids=["F002"], assume_yes=True)
+        assert results[0][1]["passed"]
+
+
+def test_classify():
+    from shardreaper.analysis import classify
+    from shardreaper.knowledge import Knowledge
+    out = classify("https://api.example.com/graphql", Knowledge())
+    assert "graphql" in out
+    out2 = classify("https://x/vpn/portal", Knowledge())
+    assert "vpn" in out2
+
+
+def test_report_redact():
+    from shardreaper.report import redact
+    md = "session=abc123 cookie=secret email=op@corp.com Bearer eyJhbGciOiJIUzI1NiJ9.x.y"
+    out = redact(md)
+    assert "op@corp.com" not in out and "[EMAIL]" in out
+    assert "abc123" not in out and "Bearer [REDACTED]" in out
+    assert "eyJhbGciOiJIUzI1NiJ9" not in out
+
+
+def test_hunt_scaffold():
+    from shardreaper.engine import cli_hunt
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory() as d:
+        base = os.path.join(d, "hunt")
+        rc = cli_hunt(SimpleNamespace(dir=base, name="t", seeds=["http://a.example"],
+                                      in_scope=["example.com"], out_of_scope=[],
+                                      objective="o", mode="red-team"))
+        assert rc == 0
+        assert os.path.isfile(os.path.join(base, "scope.md"))
+        assert os.path.isdir(os.path.join(base, "findings"))
+        assert os.path.isdir(os.path.join(base, "evidence"))
+        assert os.path.isfile(os.path.join(base, "state.json"))
+
 if __name__ == "__main__":
     import traceback
     failed = 0

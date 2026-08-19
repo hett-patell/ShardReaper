@@ -88,18 +88,24 @@ _PHASE_NORM = {
     "recon": "recon",
     "initial access": "initial-access",
     "delivery": "initial-access",
+    "execution": "initial-access",
     "situational awareness": "discovery",
     "discovery": "discovery",
     "credential dumping": "credential-access",
     "credential access": "credential-access",
     "privilege escalation": "privilege-escalation",
+    "escalation": "privilege-escalation",
     "defense evasion": "defense-evasion",
     "persistence": "persistence",
     "lateral movement": "lateral-movement",
+    "collection": "collection",
     "exfiltration": "exfiltration",
     "miscellaneous": "misc",
+    "misc": "misc",
     "c2": "c2",
     "command and control": "c2",
+    "resource development": "initial-access",
+    "impact": "misc",
 }
 
 
@@ -157,9 +163,96 @@ def _parse_rtt(rtt_root):
         m = re.search(r"^###.*?\[([^\]]+)\]\((https?://[^)]+)\)", ln)
         if m and "🔙" not in m.group(1) and "tool-list" not in m.group(2):
             name = m.group(1).strip()
+            install = None
+            # capture the fenced **Install:** block that follows the entry
+            j = i + 1
+            while j < n and not re.match(r"^### ", lines[j]):
+                if "**Install:**" in lines[j]:
+                    k = j + 1
+                    block = []
+                    while k < n and not lines[k].strip().startswith("```"):
+                        k += 1
+                    k += 1
+                    while k < n and not lines[k].strip().startswith("```"):
+                        block.append(lines[k].strip())
+                        k += 1
+                    install = "\n".join(block)[:400]
+                    break
+                j += 1
             out.append({"name": name, "phase": phase, "url": m.group(2),
-                        "desc": f"see {m.group(2)}"})
+                        "desc": f"see {m.group(2)}", "install": install})
     # de-dup by url
+    seen, dedup = set(), []
+    for e in out:
+        if e["url"] in seen:
+            continue
+        seen.add(e["url"])
+        dedup.append(e)
+    return dedup
+
+
+_AWESOME_TOC = ["Initial Access", "Execution", "Persistence", "Privilege Escalation",
+                "Defense Evasion", "Credential Access", "Discovery", "Lateral Movement",
+                "Collection", "Exfiltration", "Command and Control",
+                "Embedded and Peripheral Devices Hacking", "Misc",
+                "RedTeam Gadgets", "Ebooks", "Training", "Certification"]
+
+
+def _parse_awesome(awesome_root):
+    """Awesome-Red-Teaming: ATT&CK-sectioned link catalog (500+ curated resources)."""
+    readme = os.path.join(awesome_root, "README.md")
+    if not os.path.isfile(readme):
+        return []
+    out = []
+    phase = "misc"
+    try:
+        lines = open(readme, "r", encoding="utf-8", errors="ignore").read().splitlines()
+    except OSError:
+        return []
+    for ln in lines:
+        m = re.match(r"^##\s+\[.*?\]\(.*?\)\s*(.+)$", ln.strip())
+        if m:
+            phase = _norm_phase(m.group(1))
+            continue
+        # bullet entries: * [Name](url) or * [Name,](url) or bare [Name](url) lines
+        for m in re.finditer(r"\[([^\]\(\)]+)\]\((https?://[^)\s]+)\)", ln):
+            name = m.group(1).strip().strip(",")
+            url = m.group(2).rstrip(".,)")
+            if name and len(name) < 120:
+                out.append({"name": name[:90], "phase": phase, "url": url,
+                            "desc": f"see {url}"})
+    # de-dup by url
+    seen, dedup = set(), []
+    for e in out:
+        if e["url"] in seen:
+            continue
+        seen.add(e["url"])
+        dedup.append(e)
+    return dedup
+
+
+def _parse_backlog(rtt_root):
+    """RedTeam-Tools backlog file: category-headed URL list."""
+    path = os.path.join(rtt_root, "backlog")
+    if not os.path.isfile(path):
+        return []
+    out = []
+    phase = "misc"
+    try:
+        lines = open(path, "r", encoding="utf-8", errors="ignore").read().splitlines()
+    except OSError:
+        return []
+    for ln in lines:
+        s = ln.strip()
+        if s and not s.startswith("http") and not s.startswith("-") and " " in s:
+            if s.lower() in _PHASE_NORM:
+                phase = _norm_phase(s)
+        m = re.search(r"(https?://[^\s)]+)", ln)
+        if m:
+            url = m.group(1).rstrip(".,)")
+            name = url.split("//")[-1].split("/")[0].replace("github.com/", "")
+            out.append({"name": name[:90], "phase": phase, "url": url,
+                        "desc": f"see {url}"})
     seen, dedup = set(), []
     for e in out:
         if e["url"] in seen:
@@ -196,6 +289,9 @@ class Weapons:
                 parsed += _parse_rtk(self.roots["toolkit"])
             if "redteam-tools" in self.roots:
                 parsed += _parse_rtt(self.roots["redteam-tools"])
+                parsed += _parse_backlog(self.roots["redteam-tools"])
+            if "awesome" in self.roots:
+                parsed += _parse_awesome(self.roots["awesome"])
             os.makedirs(CACHE_DIR, exist_ok=True)
             try:
                 with open(CACHE_FILE, "w", encoding="utf-8") as f:
@@ -260,7 +356,9 @@ def cli_weapons(args):
     for e in results:
         print(f"[{e['phase']:16s}] {e['name']}  ({e['source']})")
         print(f"    {e['url']}")
-        if e.get("desc"):
+        if e.get("install"):
+            print(f"    install: {e['install'][:160].replace(chr(10), ' ; ')}")
+        elif e.get("desc"):
             print(f"    {e['desc'][:140]}")
 
 

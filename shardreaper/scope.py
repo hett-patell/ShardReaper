@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 scope.py — deterministic scope enforcement for ShardReaper.
 
 The agent may run unattended and is trained to be aggressive. Aggression is
@@ -145,6 +145,43 @@ class Scope:
         return cls(d.get("in_scope", []), d.get("out_of_scope", []),
                    d.get("seeds", []), d.get("name", "engagement"))
 
+    @classmethod
+    def load_md(cls, path):
+        """Load a BugHunter-style markdown scope file:
+            ## In scope            ## Out of scope          ## Seeds
+            * example.com          * admin.example.com      * http://api.example.com
+            * 10.0.0.0/8
+        """
+        in_scope, out_of_scope, seeds, name = [], [], [], None
+        section = None
+        with open(path, "r", encoding="utf-8") as f:
+            for ln in f:
+                s = ln.strip()
+                m = re.match(r"^#+\s*(.+)$", s)
+                if m:
+                    head = m.group(1).strip().lower()
+                    if "in scope" in head or head == "in":
+                        section = "in"
+                    elif "out of scope" in head or head == "out":
+                        section = "out"
+                    elif "seed" in head:
+                        section = "seeds"
+                    else:
+                        section = None
+                    if "scope" in head and name is None:
+                        name = m.group(1).strip()
+                    continue
+                m = re.match(r"^[-*]\s+(.+)$", s)
+                if m and section:
+                    item = m.group(1).strip()
+                    if section == "in":
+                        in_scope.append(item)
+                    elif section == "out":
+                        out_of_scope.append(item)
+                    elif section == "seeds":
+                        seeds.append(item)
+        return cls(in_scope, out_of_scope, seeds, name or "engagement")
+
     def in_scope_host(self, target):
         """Host-level check (port/path blind) — used for DNS/discovery gates."""
         host = _host_of(target)
@@ -202,7 +239,8 @@ def check(targets, scope_path=None, in_scope=None, out_of_scope=None):
     """CLI entry: deterministic gate. Exits non-zero on any out-of-scope hit."""
     if scope_path:
         try:
-            s = Scope.load(scope_path)
+            s = (Scope.load_md(scope_path) if scope_path.endswith(".md")
+                 else Scope.load(scope_path))
         except (OSError, ValueError) as e:
             print(f"error loading scope {scope_path}: {e}")
             return 1

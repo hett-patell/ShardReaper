@@ -140,7 +140,11 @@ class Knowledge:
         if key == "bughunter":
             return len(self._scan_md(os.path.join(self.roots[key], "skills"), "SKILL.md"))
         if key == "ired":
-            return len(self._scan_md(os.path.join(self.roots[key], "offensive-security"), ".md"))
+            base = self.roots[key]
+            n = 0
+            for sub in ("offensive-security", "miscellaneous-reversing-forensics", "lab"):
+                n += len(self._scan_md(os.path.join(base, sub), ".md"))
+            return n
         if key == "atomic":
             atomics_dir = os.path.join(self.roots[key], "atomics")
             if os.path.isdir(atomics_dir):
@@ -166,7 +170,7 @@ class Knowledge:
             return self._docs
         t0 = time.time()
         docs = []
-        # --- hacktricks skills (SKILL.MD) ---
+        # --- hacktricks skills (SKILL.MD) + their payload scripts ---
         if "hacktricks" in self.roots:
             base = self.roots["hacktricks"]
             for p in self._scan_md(os.path.join(base, "skills"), "SKILL.MD"):
@@ -179,17 +183,39 @@ class Knowledge:
                     name = os.path.basename(os.path.dirname(p))
                 docs.append(_Doc("hacktricks", os.path.relpath(p, base), p,
                                  name, desc, set(tokenize(text[:4000]))))
-        # --- ired.team writeups ---
+            # payload scripts under skills/*/scripts (ps1/py/sh/c/go/...)
+            for dirpath, _dirs, files in os.walk(os.path.join(base, "skills")):
+                if not dirpath.endswith("scripts"):
+                    continue
+                for fn in files:
+                    if not re.search(r"\.(ps1|py|sh|c|go|rs|vbs|bat|js|txt)$", fn):
+                        continue
+                    p = os.path.join(dirpath, fn)
+                    try:
+                        text = open(p, "r", encoding="utf-8", errors="ignore").read()
+                    except OSError:
+                        continue
+                    docs.append(_Doc("hacktricks", os.path.relpath(p, base), p,
+                                     f"payload: {fn}", "", set(tokenize(text[:2000]))))
+        # --- ired.team writeups + reversing/forensics + lab infrastructure ---
         if "ired" in self.roots:
             base = self.roots["ired"]
-            for p in self._scan_md(os.path.join(base, "offensive-security"), ".md"):
-                try:
-                    text = open(p, "r", encoding="utf-8", errors="ignore").read()
-                except OSError:
-                    continue
-                title = os.path.basename(p)[:-3].replace("-", " ").title()
-                docs.append(_Doc("ired", os.path.relpath(p, base), p, title, "",
-                                 set(tokenize(text[:2500]))))
+            for sub in ("offensive-security", "miscellaneous-reversing-forensics", "lab"):
+                for p in self._scan_md(os.path.join(base, sub), ".md"):
+                    try:
+                        text = open(p, "r", encoding="utf-8", errors="ignore").read()
+                    except OSError:
+                        continue
+                    title = os.path.basename(p)[:-3].replace("-", " ").title()
+                    docs.append(_Doc("ired", os.path.relpath(p, base), p, title, "",
+                                     set(tokenize(text[:2500]))))
+            # lab configs (sysmon/logstash/interfaces) are non-md but still indexed
+            for p in self._scan_md(os.path.join(base, "lab"), ".xml") + \
+                    self._scan_md(os.path.join(base, "lab"), ".conf") + \
+                    self._scan_md(os.path.join(base, "lab"), ".yml"):
+                docs.append(_Doc("ired", os.path.relpath(p, base), p,
+                                 f"lab: {os.path.basename(p)}", "",
+                                 set(tokenize(open(p, errors="ignore").read()[:1500]))))
         # --- bughunter skills ---
         if "bughunter" in self.roots:
             base = self.roots["bughunter"]

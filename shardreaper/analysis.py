@@ -11,6 +11,7 @@ analysis.py — the operator's decision layer.
 
 All deterministic; the LLM brain (if configured) only refines.
 """
+import json
 import os
 import re
 
@@ -24,6 +25,19 @@ GATE_QUESTIONS = [
     ("q7", "Is the severity honest — not inflated, not under-sold?"),
 ]
 GATE_NEGATIVE = {"q6"}
+
+# classes a program will reject on sight — kill these before writing anything
+ALWAYS_REJECTED = [
+    "self-xss", "missing best-practice header alone", "version disclosure alone",
+    "clickjacking without demonstrated impact", "spf/dmarc alone",
+    "mixed content", "error page stack trace alone", "cookies without secure flag alone",
+    "rate limiting on login (unless lockout/ATO)", "ssl cert expiry alone",
+]
+
+
+def _is_always_rejected(f):
+    blob = f"{f.get('title', '')} {f.get('class', '')} {f.get('detail', '')}".lower()
+    return any(k in blob for k in ALWAYS_REJECTED)
 
 
 def run_gate(answers, note=""):
@@ -47,6 +61,12 @@ def triage(eng, finding_ids=None, interactive=True, assume_yes=False):
     findings = [f for f in eng.state.get("findings", [])
                 if finding_ids is None or f["id"] in finding_ids]
     for f in findings:
+        if _is_always_rejected(f):
+            f["gate"] = {"passed": False, "decision": "kill",
+                         "answers": {}, "note": "always-rejected class"}
+            eng.log(f"triage {f['id']}: KILL (always-rejected class)", "err")
+            out.append((f, f["gate"]))
+            continue
         if interactive and not assume_yes:
             print(f"\n=== triage {f['id']} — {f['title'][:70]} "
                   f"[{f.get('severity', '?')}] ===")
@@ -65,6 +85,31 @@ def triage(eng, finding_ids=None, interactive=True, assume_yes=False):
         out.append((f, result))
     eng.save()
     return out
+
+
+def validate(eng, finding_ids=None, assume_yes=False):
+    """Full validation: 7-Question Gate + always-rejected list + 4 pre-submission gates."""
+    results = triage(eng, finding_ids, interactive=not assume_yes, assume_yes=assume_yes)
+    for f, gate in results:
+        if not gate.get("passed"):
+            continue
+        checks = {
+            "demonstrable-now": bool(f.get("evidence")),
+            "accepted-impact": not _is_always_rejected(f),
+            "evidence-hygiene": True,   # enforced by report --redact
+            "honest-severity": f.get("severity") in
+                ("critical", "high", "medium", "low", "info"),
+        }
+        gate["checks"] = checks
+        gate["passed"] = all(checks.values())
+        if not gate["passed"]:
+            gate["decision"] = "kill"
+            eng.log(f"validate {f['id']}: KILL (failed: "
+                    f"{[k for k, v in checks.items() if not v]})", "err")
+        else:
+            eng.log(f"validate {f['id']}: PASS — write the report", "win")
+    eng.save()
+    return results
 
 
 # ---------------- chain builder ----------------
@@ -147,9 +192,65 @@ def surface(eng):
     return "\n".join(out)
 
 
-# ---------------- intel ----------------
-def intel(eng, kb, query=None):
-    """Tech-stack → CVE/playbook intel. Local corpus first; brain optional."""
+# ---------------- classify ----------------
+CLASS_SIGNATURES = [
+    (r"(graphql|/graphql)", "graphql"), (r"(oauth|authorize\?)", "oauth"),
+    (r"(swagger|openapi|/api/)", "api-misconfig"), (r"(\.jwt|token=)", "jwt"),
+    (r"(upload|/files/)", "file-upload"), (r"(\.json|rest)", "spa-api"),
+    (r"(wp-|wordpress)", "wordpress"), (r"(asp|\.aspx)", "aspnet"),
+    (r"(sharepoint|_layouts)", "sharepoint"), (r"(spring|actuator)", "springboot"),
+    (r"(\.php)", "php"), (r"(login|signin|auth)", "auth-bypass"),
+    (r"(\.git|\.env|backup)", "source-leak"), (r"(next\.js|__next)", "nextjs"),
+    (r"(vcenter|vmware)", "vcenter"), (r"(m365|office365|login\.microsoft)", "m365"),
+    (r"(okta|saml|sso)", "saml"), (r"(vpn|sslvpn)", "vpn-appliance"),
+]
+
+
+def classify(surface, kb, limit=6):
+    """Map a URL/tech-string to the attack classes + playbooks that apply."""
+    blob = surface.lower()
+    classes = sorted({c for rx, c in CLASS_SIGNATURES if re.search(rx, blob)})
+    lines = [f"classify: {surface}"]
+    if not classes:
+        lines.append("  no strong signature — run shardreaper recon for tech detection")
+    for c in classes:
+        lines.append(f"  [{c}]")
+        hits = kb.search(f"{c} exploit", limit=3)
+        for h in hits:
+            lines.append(f"      {h['corpus']:12s} {h['title'][:60]} — {h['rel']}")
+    return "\n".join(lines)
+
+
+# ---------------- intel (offline corpus + optional NVD online) ----------------
+def nvd_lookup(keyword, timeout=15, limit=8):
+    """NVD CVE keyword search (services.nvd.nist.gov, keyless, best-effort)."""
+    import urllib.request
+    import urllib.parse
+    q = urllib.parse.quote(keyword)
+    url = ("https://services.nvd.nist.gov/rest/json/cves/2.0"
+           f"?keywordSearch={q}&resultsPerPage={limit}")
+    req = urllib.request.Request(url, headers={"User-Agent": "ShardReaper/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        out = []
+        for vuln in data.get("vulnerabilities", []):
+            cve = vuln.get("cve", {})
+            cid = cve.get("id", "")
+            desc = (cve.get("descriptions") or [{}])[0].get("value", "")[:140]
+            sev = ""
+            try:
+                sev = cve["metrics"]["cvssMetricV31"][0]["cvssData"]["baseSeverity"]
+            except Exception:
+                pass
+            out.append((cid, sev, desc))
+        return out
+    except Exception:
+        return None
+
+
+def intel(eng, kb, query=None, online=False):
+    """Tech-stack → CVE/playbook intel. Local corpus first; NVD optional."""
     techs = set()
     for t in eng.state.get("targets", []):
         for u in t.get("urls", []):
@@ -163,6 +264,14 @@ def intel(eng, kb, query=None):
             lines.append(f"  [{tech}]")
             for h in hits:
                 lines.append(f"      {h['corpus']:12s} {h['title'][:60]} — {h['rel']}")
+        if online:
+            cves = nvd_lookup(tech)
+            if cves:
+                lines.append(f"  [nvd: {tech}]")
+                for cid, sev, desc in cves[:5]:
+                    lines.append(f"      {cid} [{sev or '?'}] {desc}")
+            else:
+                lines.append(f"  [nvd: {tech}] unreachable (offline?)")
     if query:
         hits = kb.search(query, limit=6)
         lines.append(f"  [query: {query}]")
@@ -219,11 +328,12 @@ def cli_triage(args):
     return 0
 
 
-def cli_surface(args):
+def cli_validate(args):
     ctx = _load_engine(args.dir)
     if not ctx:
         return 1
-    print(surface(ctx[0]))
+    eng = ctx[0]
+    validate(eng, args.finding_ids or None, assume_yes=args.yes)
     return 0
 
 
@@ -231,7 +341,22 @@ def cli_intel(args):
     ctx = _load_engine(args.dir)
     if not ctx:
         return 1
-    print(intel(ctx[0], ctx[1], " ".join(args.query) if args.query else None))
+    print(intel(ctx[0], ctx[1], " ".join(args.query) if args.query else None,
+                online=args.online))
+    return 0
+
+
+def cli_classify(args):
+    from .knowledge import Knowledge
+    print(classify(" ".join(args.target), Knowledge()))
+    return 0
+
+
+def cli_surface(args):
+    ctx = _load_engine(args.dir)
+    if not ctx:
+        return 1
+    print(surface(ctx[0]))
     return 0
 
 
@@ -262,14 +387,25 @@ def build_arg_parser(sub):
     t.add_argument("--yes", action="store_true", help="non-interactive pass")
     t.set_defaults(fn=cli_triage)
 
-    s = sub.add_parser("surface", help="ranked attack surface (P1/P2/kill list)")
-    s.add_argument("dir")
-    s.set_defaults(fn=cli_surface)
+    v = sub.add_parser("validate", help="full validation: gate + always-rejected + 4 checks")
+    v.add_argument("dir", help="engagement folder")
+    v.add_argument("finding_ids", nargs="*")
+    v.add_argument("--yes", action="store_true")
+    v.set_defaults(fn=cli_validate)
 
     i = sub.add_parser("intel", help="tech-stack -> CVE/playbook intel")
     i.add_argument("dir")
     i.add_argument("query", nargs="*")
+    i.add_argument("--online", action="store_true", help="also query NVD (keyless)")
     i.set_defaults(fn=cli_intel)
+
+    cl = sub.add_parser("classify", help="map a URL/tech string to attack classes")
+    cl.add_argument("target", nargs="+")
+    cl.set_defaults(fn=cli_classify)
+
+    s = sub.add_parser("surface", help="ranked attack surface (P1/P2/kill list)")
+    s.add_argument("dir")
+    s.set_defaults(fn=cli_surface)
 
     c = sub.add_parser("chain", help="build an A→B→C exploit chain")
     c.add_argument("dir")

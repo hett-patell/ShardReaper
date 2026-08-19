@@ -7,6 +7,7 @@ with severity + ATT&CK mapping + evidence, executed actions, weapon/KB
 references, and recommended next moves. Brutaal, terse, concrete.
 """
 import os
+import re
 from collections import Counter
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -208,6 +209,25 @@ def render_intigriti(eng, only_passed=True):
 PLATFORM_RENDERERS = {"h1": render_h1, "bugcrowd": render_bugcrowd,
                       "intigriti": render_intigriti}
 
+# evidence hygiene — strip operator PII / session secrets before anything ships
+REDACT_PATTERNS = [
+    (r"[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}", "[JWT]"),
+    (r"session(?:id)?\s*=\s*[A-Za-z0-9_\-]+", "session=[REDACTED]"),
+    (r"cookie\s*[:=]\s*[^;\s]+", "cookie=[REDACTED]"),
+    (r"(AKIA|ASIA)[A-Z0-9]{16}", "[AWS-KEY]"),
+    (r"sk-[A-Za-z0-9]{20,}", "[API-KEY]"),
+    (r"gh[pousr]_[A-Za-z0-9]{20,}", "[GH-TOKEN]"),
+    (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[EMAIL]"),
+    (r"password\s*[=:]\s*\S+", "password=[REDACTED]"),
+    (r"Bearer\s+[A-Za-z0-9\-._]+", "Bearer [REDACTED]"),
+]
+
+
+def redact(md):
+    for rx, repl in REDACT_PATTERNS:
+        md = re.sub(rx, repl, md, flags=re.I)
+    return md
+
 
 def cli_report(args):
     from .state import Engagement
@@ -219,15 +239,14 @@ def cli_report(args):
     if args.platform in PLATFORM_RENDERERS:
         md = PLATFORM_RENDERERS[args.platform](eng)
         out = os.path.join(base, f"REPORT-{args.platform.upper()}.md")
-        with open(out, "w", encoding="utf-8") as f:
-            f.write(md)
-        print(f"{args.platform} report written: {out}")
-        return 0
-    md = render_report(eng)
-    out = os.path.join(base, "REPORT.md")
+    else:
+        md = render_report(eng)
+        out = os.path.join(base, "REPORT.md")
+    if args.redact:
+        md = redact(md)
     with open(out, "w", encoding="utf-8") as f:
         f.write(md)
-    print(f"report written: {out}")
+    print(f"report written: {out}{' (redacted)' if args.redact else ''}")
     return 0
 
 
@@ -237,5 +256,7 @@ def build_arg_parser(sub):
     p.add_argument("--platform", default="client",
                    choices=["client", "h1", "bugcrowd", "intigriti"],
                    help="report flavor (client default)")
+    p.add_argument("--redact", action="store_true",
+                   help="strip PII/session secrets from the output (evidence hygiene)")
     p.set_defaults(fn=cli_report)
     return p

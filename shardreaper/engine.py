@@ -404,6 +404,48 @@ def cli_autopilot(args):
     return 0
 
 
+def cli_hunt(args):
+    """BugHunter-style engagement scaffolder: scope.md + structured folders.
+
+    Invoking /hunt asserts the operator holds authorization for the named
+    scope. The deliverable is a reproducible, remediable finding; an
+    out-of-scope host stops the run rather than widening it.
+    """
+    base = os.path.abspath(args.dir)
+    os.makedirs(base, exist_ok=True)
+    for sub in ("findings", "evidence", "recon", "reports"):
+        os.makedirs(os.path.join(base, sub), exist_ok=True)
+    scope_md = os.path.join(base, "scope.md")
+    with open(scope_md, "w", encoding="utf-8") as f:
+        f.write("# Scope — {name}\n\n## In scope\n\n{p}\n## Out of scope\n\n{p}\n"
+                "## Seeds\n\n{p}\n".format(
+                    name=args.name, p="* (paste patterns here — e.g. example.com, 10.0.0.0/24)"))
+    scope_json = os.path.join(base, "scope.json")
+    with open(scope_json, "w", encoding="utf-8") as f:
+        json.dump({"name": args.name, "in_scope": args.in_scope or [],
+                   "out_of_scope": args.out_of_scope or [],
+                   "seeds": args.seeds or []}, f, indent=2)
+    eng = Engagement(base, args.name, scope_json)
+    eng.state["seeds"] = args.seeds or []
+    if args.objective:
+        eng.state["objective"] = args.objective
+    eng.save()
+    mode = args.mode
+    eng.log(f"hunt scaffold ready [{mode}] — fill scope.md, then: "
+            f"shardreaper run {base} --phases recon,analyze,plan,attack,report")
+    with open(os.path.join(base, "notes.md"), "w", encoding="utf-8") as f:
+        f.write(f"# {args.name} — operator notes\n\n"
+                f"engagement frame: authorized assessment of the scope in scope.md\n"
+                f"mode: {mode}\nobjective: {args.objective or '(not set)'}\n")
+    print()
+    print(f"engagement assertion: the operator holds written authorization for "
+          f"the named scope — {mode} mode.")
+    print(f"scaffold: {base}")
+    print(f"  scope.md   <- fill the in/out patterns (BugHunter-compatible)")
+    print(f"  findings/ evidence/ recon/ reports/   <- structured workspace")
+    return 0
+
+
 def cli_status(args):
     base = os.path.abspath(args.dir)
     if not os.path.isfile(os.path.join(base, "state.json")):
@@ -456,6 +498,16 @@ def build_arg_parser(sub):
     ap.add_argument("--mock", action="store_true")
     ap.add_argument("--yes", action="store_true", help="skip prompts (non-interactive)")
     ap.set_defaults(fn=cli_autopilot)
+
+    hp = sub.add_parser("hunt", help="rich engagement scaffold (scope.md + workspace)")
+    hp.add_argument("dir", help="engagement folder")
+    hp.add_argument("--name", default="engagement")
+    hp.add_argument("--seeds", action="append", default=[])
+    hp.add_argument("--in-scope", action="append", default=[])
+    hp.add_argument("--out-of-scope", action="append", default=[])
+    hp.add_argument("--objective", default="")
+    hp.add_argument("--mode", default="red-team", choices=["red-team", "wapt"])
+    hp.set_defaults(fn=cli_hunt)
 
     sp = sub.add_parser("status", help="engagement status")
     sp.add_argument("dir")
