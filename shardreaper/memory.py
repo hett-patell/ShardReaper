@@ -99,23 +99,37 @@ def touch_session(host, engagement):
     _save_rollup(host, roll)
 
 
-def checkpoint(engagement, phase, proven=None, ruled_out=None, open_items=None):
+def checkpoint(engagement, phase, proven=None, ruled_out=None, open_items=None,
+               findings=None):
     """Post-Cobblestone lesson 10: the ledger is a checkpoint log, not a
     decoration. Call this after EVERY phase — proven findings and ruled-out
     techniques land in the cross-engagement memory so a resumed run never
-    re-proves or re-wastes anything."""
+    re-proves or re-wastes anything. `findings` carries the FULL finding
+    records (id/severity/class/title/target) so a resumed run can re-attach
+    evidence even if the engagement folder is lost."""
     _append(os.path.join(_root(), "notes.jsonl"), {
         "ts": _now(), "schema": SCHEMA_VERSION, "kind": "checkpoint",
         "engagement": engagement, "phase": phase,
         "proven": proven or [],
         "ruled_out": ruled_out or [],
         "open": open_items or [],
+        "findings": findings or [],
     })
     roll = _rollup("_engagement_" + str(engagement))
     roll.setdefault("checkpoints", []).append(
         {"ts": _now(), "phase": phase,
          "proven": len(proven or []), "ruled_out": len(ruled_out or []),
-         "open": len(open_items or [])})
+         "open": len(open_items or []),
+         "findings": len(findings or [])})
+    if findings:
+        roll.setdefault("checkpoint_findings", {})
+        for f in findings:
+            fid = f.get("id") or f.get("title")
+            if fid:
+                roll["checkpoint_findings"][fid] = {
+                    k: f.get(k) for k in
+                    ("id", "severity", "class", "title", "target", "technique")
+                    if f.get(k) is not None}
     _save_rollup("_engagement_" + str(engagement), roll)
 
 

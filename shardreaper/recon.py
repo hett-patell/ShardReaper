@@ -201,19 +201,6 @@ class Recon:
         except OSError:
             return None
 
-
-def adaptive_policy(answered, total, chunk_idx):
-    """Decision table for scan pacing — pure function, unit-tested."""
-    if total < 20:
-        return {"pause": 0, "timeout": 3.0, "ban": False}
-    ratio = answered / total
-    if ratio >= 0.5:
-        return {"pause": 0, "timeout": 3.0, "ban": False}
-    if ratio < 0.05 and chunk_idx >= 1:
-        return {"pause": 0, "timeout": 3.0, "ban": True}
-    return {"pause": 5.0, "timeout": min(3.0 + 3.0 * chunk_idx, 15.0),
-            "ban": False}
-
     def _banner(self, host, port):
         try:
             with socket.create_connection((host, port), timeout=self.timeout) as s:
@@ -229,6 +216,7 @@ def adaptive_policy(answered, total, chunk_idx):
                 return text[:120] if text else None
         except OSError:
             return None
+
 
     # ---------------- TLS ----------------
     def tls_cert(self, host, port=443):
@@ -265,7 +253,7 @@ def adaptive_policy(answered, total, chunk_idx):
                     }
         except OSError as e:
             return {"host": host, "error": str(e)}
-
+    
     # ---------------- HTTP ----------------
     def _http(self, url, method="GET", headers=None, timeout=None, body=None):
         u = urlparse(url)
@@ -297,7 +285,7 @@ def adaptive_policy(answered, total, chunk_idx):
                "body": data.decode("utf-8", errors="ignore")[:12000]}
         conn.close()
         return out
-
+    
     def http_probe(self, url):
         try:
             r = self._http(url)
@@ -311,7 +299,7 @@ def adaptive_policy(answered, total, chunk_idx):
                     "tech": tech, "headers": r["headers"]}
         except (OSError, OutOfScopeError) as e:
             return {"url": url, "error": str(e)}
-
+    
     @staticmethod
     def _detect_tech(headers, body):
         tech = set()
@@ -333,7 +321,7 @@ def adaptive_policy(answered, total, chunk_idx):
             if token in body_l:
                 tech.add(name)
         return sorted(tech)
-
+    
     def check_paths(self, url, paths=None):
         """Probe common sensitive/interesting paths; report statuses."""
         out = []
@@ -357,7 +345,7 @@ def adaptive_policy(answered, total, chunk_idx):
             except (OSError, OutOfScopeError):
                 continue
         return out
-
+    
     def cors_check(self, url):
         try:
             r = self._http(url, headers={"Origin": "https://evil.example"})
@@ -368,7 +356,7 @@ def adaptive_policy(answered, total, chunk_idx):
             return {"url": url, "vulnerable": False, "acao": acao}
         except (OSError, OutOfScopeError) as e:
             return {"url": url, "error": str(e)}
-
+    
     def security_header_audit(self, url):
         try:
             r = self._http(url)
@@ -376,11 +364,11 @@ def adaptive_policy(answered, total, chunk_idx):
             return {"url": url, "error": str(e)}
         missing = [h for h in MISSING_HEADERS if h not in r["headers"]]
         return {"url": url, "status": r["status"], "missing": missing}
-
+    
     # ---------------- external tools ----------------
     def tool_path(self, name):
         return shutil.which(name)
-
+    
     def run_tool(self, name, args, timeout=300, cwd=None):
         """Run an external tool if installed; returns dict or None if missing."""
         path = self.tool_path(name)
@@ -394,7 +382,7 @@ def adaptive_policy(answered, total, chunk_idx):
                     "stderr": (p.stderr or "")[-2000:]}
         except (subprocess.TimeoutExpired, OSError) as e:
             return {"ok": False, "error": str(e)}
-
+    
     def nmap(self, host, ports=None, scripts=None):
         args = ["-Pn", "--open"]
         if ports:
@@ -425,9 +413,21 @@ def adaptive_policy(answered, total, chunk_idx):
             return {"tool": "nmap", "services": services, "raw": r["stdout"][:2000]}
         except Exception:
             return {"tool": "nmap", "services": [], "raw": r["stdout"][:2000]}
+    
+    
+    # ---------------- orchestrated recon run ----------------
+def adaptive_policy(answered, total, chunk_idx):
+    """Decision table for scan pacing — pure function, unit-tested."""
+    if total < 20:
+        return {"pause": 0, "timeout": 3.0, "ban": False}
+    ratio = answered / total
+    if ratio >= 0.5:
+        return {"pause": 0, "timeout": 3.0, "ban": False}
+    if ratio < 0.05 and chunk_idx >= 1:
+        return {"pause": 0, "timeout": 3.0, "ban": True}
+    return {"pause": 5.0, "timeout": min(3.0 + 3.0 * chunk_idx, 15.0),
+            "ban": False}
 
-
-# ---------------- orchestrated recon run ----------------
 def run_recon(scope, seeds, wordlist=None, ports=None, top_ports=100, workers=32,
               log=None, include_external=True, paths=True, osint=True):
     """Full recon sweep over in-scope seeds. Returns targets list for state."""
@@ -456,7 +456,10 @@ def run_recon(scope, seeds, wordlist=None, ports=None, top_ports=100, workers=32
             log(f"{host}: no DNS records", "warn")
             continue
         open_ports = r.port_scan(host, ports=ports, top=top_ports)
-        http_ports = [p for p in open_ports if p in HTTP_PORTS]
+        # well-known web ports always get an HTTP probe; explicit operator-
+        # supplied port lists get probed too (they were chosen for a reason)
+        http_ports = [p for p in open_ports
+                      if p in HTTP_PORTS or (ports and p in ports)]
         target = {"host": host, "addrs": addrs, "ports": open_ports,
                   "urls": [], "intel": {}, "findings": []}
         for p in http_ports:

@@ -23,6 +23,11 @@ def _to64(v, n):
     return out
 
 
+def _b64_triple(b2, b1, b0, n):
+    """sha-crypt final encoding: three digest bytes -> n base64-ish chars."""
+    return _to64((b2 << 16) | (b1 << 8) | b0, n)
+
+
 def _b64_from_bytes(b):
     """Encode bytes per the md5crypt 3-byte -> 4-char (little-endian) rule."""
     out = ""
@@ -133,9 +138,6 @@ def sha_crypt(password, salt, magic="$5$", rounds=None):
             c.update(p_bytes)
         A = c.digest()
     # 9: final encoding
-    def b64(b2, b1, b0, n):
-        return _to64((b2 << 16) | (b1 << 8) | b0, n)
-
     out = ""
     if use512:
         table = [(0, 21, 42), (22, 43, 1), (44, 2, 23), (3, 24, 45), (25, 46, 4),
@@ -144,14 +146,14 @@ def sha_crypt(password, salt, magic="$5$", rounds=None):
                  (56, 14, 35), (15, 36, 57), (37, 58, 16), (59, 17, 38),
                  (18, 39, 60), (40, 61, 19), (62, 20, 41)]
         for a, b, c in table:
-            out += b64(A[a], A[b], A[c], 4)
-        out += b64(0, 0, A[63], 2)
+            out += _b64_triple(A[a], A[b], A[c], 4)
+        out += _b64_triple(0, 0, A[63], 2)
     else:
         table = [(0, 10, 20), (21, 1, 11), (12, 22, 2), (3, 13, 23), (24, 4, 14),
                  (15, 25, 5), (6, 16, 26), (27, 7, 17), (18, 28, 8), (9, 19, 29)]
         for a, b, c in table:
-            out += b64(A[a], A[b], A[c], 4)
-        out += b64(0, A[31], A[30], 3)
+            out += _b64_triple(A[a], A[b], A[c], 4)
+        out += _b64_triple(0, A[31], A[30], 3)
     head = magic + S.decode()
     if rounds and rounds != 5000:
         head = f"{magic}rounds={rounds}${S.decode()}"

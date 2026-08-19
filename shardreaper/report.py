@@ -28,17 +28,15 @@ def render_report(eng, kb=None):
     st = eng.state
     L = []
     a = L.append
-    def nl():
-        L.append("")
     a(f"# ShardReaper Engagement Report — {st.get('name', 'engagement')}")
-    nl()
+    a("")
     a(f"- **Created:** {st.get('created')}  **Updated:** {st.get('updated')}")
     a(f"- **Phase:** {eng.phase}")
     a(f"- **Objective:** {st.get('objective') or '(not set)'}")
     a(f"- **Scope file:** {st.get('scope_path')}")
-    nl()
+    a("")
     a("## 1. Mission Summary")
-    nl()
+    a("")
     findings = st.get("findings", [])
     actions = st.get("actions", [])
     targets = st.get("targets", [])
@@ -47,23 +45,23 @@ def render_report(eng, kb=None):
     sev = Counter(f.get("severity", "info") for f in findings)
     a("Severity: " + ", ".join(f"{k.upper()} {v}" for k, v in sorted(
         sev.items(), key=lambda x: SEVERITY_ORDER.get(x[0], 9))))
-    nl()
+    a("")
     a("## 2. Findings")
-    nl()
+    a("")
     if not findings:
         a("_No confirmed findings yet — attack phase pending or target hardened._")
     for f in sorted(findings, key=lambda x: SEVERITY_ORDER.get(x.get("severity", "info"), 9)):
         a(f"### {f['id']} — {f['title']}  `{f['severity'].upper()}`")
-        nl()
+        a("")
         a(f"- **Target:** `{f['target']}`")
         a(f"- **Class:** {f.get('class') or f.get('type')}")
         a(f"- **ATT&CK:** {_attck_link(f.get('technique'))}")
         a(f"- **Detail:** {f.get('detail', '')}")
         if f.get("evidence"):
             a(f"- **Evidence:** `{f.get('evidence')}`")
-        nl()
+        a("")
     a("## 3. Targets & Intel")
-    nl()
+    a("")
     for t in targets:
         a(f"### {t['host']}")
         ports = t.get("ports") or {}
@@ -77,35 +75,35 @@ def render_report(eng, kb=None):
             a(f"- **Hints:** {', '.join(hints[:10])}")
         for f_ in t.get("findings", []):
             a(f"- **{f_.get('severity', 'info').upper()}** {f_.get('detail', '')[:160]}")
-    nl()
+    a("")
     a("## 4. Attack Plan")
-    nl()
+    a("")
     plan = st.get("plan", [])
     if not plan:
         a("_No plan items._")
     for p in plan[:25]:
         a(f"- `{p.get('severity', 'info').upper():5s}` {p.get('action')} — "
           f"{p.get('detail', '')[:110]}  [{_attck_link(p.get('technique'))}]")
-    nl()
+    a("")
     a("## 5. Executed Actions (ledger)")
-    nl()
+    a("")
     if not actions:
         a("_None._")
     for act in actions[-30:]:
         a(f"- `{act.get('ts', '')}` **{act.get('technique')}** {act.get('outcome')} @ "
           f"{act.get('target')} — {act.get('detail', '')[:100]}")
-    nl()
+    a("")
     a("## 6. Knowledge & Weapons Referenced")
-    nl()
+    a("")
     refs = set()
     for note in st.get("notes", []):
         for k in (note.get("kb") or []):
             refs.add(k)
     for r in sorted(refs)[:15]:
         a(f"- {r}")
-    nl()
+    a("")
     a("## 7. Recommended Next Moves")
-    nl()
+    a("")
     for f in [x for x in findings if x.get("severity") in ("high", "critical")][:6]:
         a(f"- Exploit **{f['title']}** at `{f['target']}` — chain into persistence/lateral.")
     high_ports = []
@@ -115,9 +113,84 @@ def render_report(eng, kb=None):
                 high_ports.append(f"{t['host']}:{p}")
     if high_ports:
         a(f"- Enumerate unusual services: `{', '.join(sorted(set(high_ports))[:10])}`")
-    a("- Run tactical phases: `shardreaper run --phases escalate,persist,move,harvest,evade,exfil`")
+    a("- Run tactical phases: `shardreaper run --phases escalate,persist,move,harvest,spray,evade,exfil`")
     a("- Re-verify findings with fresh evidence before the debrief.")
     return "\n".join(L) + "\n"
+
+
+# ---------------- report integrity: merge, never clobber ----------------
+EMPTY_SECTION_LINES = (
+    "_No confirmed findings yet — attack phase pending or target hardened._",
+    "_No plan items._", "_None._",
+    "_No passing findings to submit._",
+)
+
+
+def _sections(md):
+    """Split a report into {heading: body} on top-level '## ' lines."""
+    secs, cur, body = {}, None, []
+    for line in (md or "").splitlines():
+        if line.startswith("## "):
+            if cur is not None:
+                secs[cur] = "\n".join(body).strip("\n")
+            cur, body = line[3:].strip(), []
+        elif cur is not None:
+            body.append(line)
+    if cur is not None:
+        secs[cur] = "\n".join(body).strip("\n")
+    return secs
+
+
+def is_empty_template_section(body):
+    """A section that carries only italic placeholders — the empty template.
+    Overwriting a real narrative with THIS is the sin the merge refuses."""
+    lines = [l.strip() for l in (body or "").splitlines()
+             if l.strip() and not l.startswith("- **Created")]
+    if not lines:
+        return True
+    return all(l in EMPTY_SECTION_LINES or
+               (l.startswith("_") and l.endswith("_")) for l in lines)
+
+
+def narrative_present(md):
+    """Does this report carry actual findings/actions content?"""
+    secs = _sections(md)
+    for h in ("2. Findings", "5. Executed Actions (ledger)"):
+        body = secs.get(h, "")
+        if body and not is_empty_template_section(body):
+            return True
+    return False
+
+
+def merge_report(old, new):
+    """Merge a fresh render into an existing report. Rules:
+
+    * sections that exist in BOTH keep the fresh content — UNLESS the fresh
+      section is the empty template, in which case the old narrative wins
+      (refuse to overwrite a narrative with the empty template);
+    * old-only sections are preserved (no narrative loss, ever);
+    * new-only sections are appended.
+    """
+    old_secs, new_secs = _sections(old), _sections(new)
+    header = (new or "").split("## ", 1)[0].rstrip()
+    merged, order = {}, list(new_secs)
+    for h, body in new_secs.items():
+        ob = old_secs.get(h)
+        if ob is not None and is_empty_template_section(body) \
+                and not is_empty_template_section(ob):
+            merged[h] = ob      # keep the narrative
+        else:
+            merged[h] = body
+    for h, body in old_secs.items():
+        if h not in merged:
+            merged[h] = body
+            order.append(h)
+    out = [header + "\n\n",
+           "> _merged with existing REPORT.md — narrative sections are "
+           "preserved, never overwritten by empty templates_\n"]
+    for h in order:
+        out.append(f"## {h}\n{merged[h].strip()}\n")
+    return "\n".join(out) + "\n"
 
 
 # ---------------- platform reports (HackerOne / Bugcrowd / Intigriti) ----------------
@@ -244,6 +317,23 @@ def cli_report(args):
         out = os.path.join(base, "REPORT.md")
     if args.redact:
         md = redact(md)
+    if args.force:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(md)
+        print(f"report written: {out}{' (redacted)' if args.redact else ''}")
+        return 0
+    # integrity: merge with any existing report, refuse to clobber narrative
+    if os.path.isfile(out):
+        try:
+            old = open(out, encoding="utf-8").read()
+        except OSError:
+            old = ""
+        if old.strip():
+            if narrative_present(old) and not narrative_present(md):
+                print("refusing to overwrite narrative with the empty "
+                      "template — merging instead")
+            md = merge_report(old, md)
+            print(f"report merged with existing {out} (narrative preserved)")
     with open(out, "w", encoding="utf-8") as f:
         f.write(md)
     print(f"report written: {out}{' (redacted)' if args.redact else ''}")
@@ -258,5 +348,7 @@ def build_arg_parser(sub):
                    help="report flavor (client default)")
     p.add_argument("--redact", action="store_true",
                    help="strip PII/session secrets from the output (evidence hygiene)")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite without merging (explicit operator override)")
     p.set_defaults(fn=cli_report)
     return p

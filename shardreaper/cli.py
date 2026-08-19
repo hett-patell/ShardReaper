@@ -56,7 +56,8 @@ def main(argv=None):
         description="ShardReaper — complete autonomous red team agent.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="scope is enforced in code, deny-by-default. engage first, attack second.")
-    ap.add_argument("--version", action="version", version="shardreaper 1.0.0")
+    ap.add_argument("--version", action="version",
+                    version=f"shardreaper {__import__('shardreaper').__version__}")
     sub = ap.add_subparsers(dest="cmd")
 
     from . import engine, knowledge, atomics, weapons, scope as scopemod
@@ -72,6 +73,9 @@ def main(argv=None):
     from . import envcheck as envcheckmod
     from . import canary as canarymod
     from . import transport as transportmod
+    from . import spray as spraymod
+    from . import k8s as k8smod
+    from . import rackcheck as rackcheckmod
 
     engine.build_arg_parser(sub)
     reportmod.build_arg_parser(sub)
@@ -88,6 +92,9 @@ def main(argv=None):
     envcheckmod.build_arg_parser(sub)
     canarymod.build_arg_parser(sub)
     transportmod.build_arg_parser(sub)
+    spraymod.build_arg_parser(sub)
+    k8smod.build_arg_parser(sub)
+    rackcheckmod.build_arg_parser(sub)
 
     kb = sub.add_parser("kb", help="search the local offensive corpus")
     kb.add_argument("query", nargs="+")

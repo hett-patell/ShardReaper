@@ -761,6 +761,234 @@ def test_memory_checkpoint():
     roll = memory._rollup("_engagement_eng-ckpt")
     assert roll["checkpoints"][-1]["phase"] == "attack"
 
+
+# ---------------- v1.2 fixes: k8s / spray / payload / rack / report ----------------
+def test_k8s_exec_url():
+    from shardreaper.k8s import build_exec_url, EXEC_PROTOCOLS
+    u = build_exec_url("default", "pod-a", "c1", ["/bin/sh", "-c", "id"])
+    assert "/exec/default/pod-a/c1?" in u
+    assert u.count("command=") == 3          # command is repeatable
+    assert "output=1" in u and "input=1" in u and "error=1" in u
+    assert EXEC_PROTOCOLS == ["v4.channel.k8s.io", "v5.channel.k8s.io"]  # v4 first
+
+
+def test_k8s_ws_codec():
+    from shardreaper.k8s import encode_frame, decode_frame, CH_STDOUT
+    f = encode_frame(bytes([CH_STDOUT]) + b"hello", opcode=0x2,
+                     mask_key=b"\x01\x02\x03\x04")
+    frame, consumed = decode_frame(f, 0)
+    assert consumed == len(f)
+    assert frame["opcode"] == 0x2
+    assert frame["payload"] == bytes([CH_STDOUT]) + b"hello"
+    # server-style unmasked frame decodes too
+    server = bytes([0x82, 0x03]) + b"abc"
+    fr, _ = decode_frame(server, 0)
+    assert fr["payload"] == b"abc"
+    assert fr["opcode"] == 0x2 and fr["fin"] == 1
+
+
+def test_k8s_pod_mounts():
+    from shardreaper.k8s import pod_mounts
+    pods = {"items": [{"metadata": {"name": "p1", "namespace": "kube-system"},
+                       "spec": {
+                           "volumes": [{"name": "hostroot",
+                                        "hostPath": {"path": "/"}}],
+                           "containers": [{"name": "c1", "volumeMounts": [
+                               {"name": "hostroot",
+                                "mountPath": "/host/root"}]}]}}]}
+    m = pod_mounts(pods)
+    assert m and m[0]["host_path"] == "/"
+    assert m[0]["mount_path"] == "/host/root"
+    assert m[0]["pod"] == "p1"
+
+
+def test_spray_classify_differential():
+    from shardreaper.spray import classify_response
+    c, lbl = classify_response(400, "websocket: the client is not using the "
+                                "websocket protocol", "kubelet")
+    assert c == "400-bad-request" and "not a denial" in lbl
+    c, lbl = classify_response(403, "websocket: unsupported channel subprotocol",
+                               "kubelet")
+    assert c == "403-protocol-mismatch"
+    c, lbl = classify_response(403, '{"message":"pods is forbidden: User '
+                               '\\"system:anonymous\\" cannot list resource"}',
+                               "kubelet")
+    assert c == "403-rbac-denial"
+    assert classify_response(401, "Unauthorized", "apiserver")[0] \
+        == "401-unauthenticated"
+    assert classify_response(404, "", "kubelet")[0] == "404-not-found"
+    assert classify_response(500, "internal error", "kubelet")[0] \
+        == "500-server-error"
+    # 400/403/500 must NEVER collapse into one verdict
+    classes = {classify_response(s, b, "")[0]
+               for s, b in ((400, "websocket"), (403, "websocket"),
+                            (403, "forbidden"), (500, "err"))}
+    assert len(classes) == 4
+    # a 403-with-subprotocol-mismatch is NOT an RBAC denial
+    assert classify_response(403, "websocket upgrade", "")[0] \
+        != classify_response(403, "forbidden", "")[0]
+
+
+def test_spray_request_forms():
+    from shardreaper.spray import request_forms
+    f = request_forms({"type": "sa-token", "value": "tok"}, "kubelet")
+    assert any("Bearer tok" in (h.get("Authorization") or "") for h, _ in f)
+    f = request_forms({"type": "password", "value": "pw", "user": "root"},
+                      "registry")
+    assert any("Basic" in (h.get("Authorization") or "") for h, _ in f)
+    f = request_forms({"type": "jwt", "value": "a.b.c"}, "http")
+    names = [n for _, n in f]
+    assert "bearer" in names and "x-api-key" in names
+
+
+def test_spray_401_retry_with_every_cred():
+    from shardreaper.spray import spray
+    d = tempfile.mkdtemp()
+    eng = Engagement(d, "spraytest", os.path.join(d, "scope.json"))
+    eng.state["seeds"] = ["10.0.0.9"]
+    calls = []
+
+    def fake_probe(surface, headers=None, timeout=6):
+        calls.append((surface["name"], headers))
+        if headers and "Bearer tokBxxxxxxyy" in (headers.get("Authorization") or ""):
+            return 200, "ok", "tcp"
+        return 401, "Unauthorized", "tcp"
+
+    creds = [{"type": "sa-token", "value": "tokAxxxxxxaa"},
+             {"type": "sa-token", "value": "tokBxxxxxxyy"}]
+    r = spray(eng, creds, log=lambda m: None, ssh=False, probe=fake_probe,
+              timeout=1)
+    assert r["hits"], "401 must trigger an automatic retry with every held credential"
+    assert "tokBxx" in r["hits"][0]["credential"]  # mask keeps first 6 chars
+    assert any(h is None for _, h in calls)  # unauthenticated baseline first
+
+
+def test_payload_literal_and_markers():
+    from shardreaper.payload import (literal, assert_literal, marker_wrap,
+                                     marker_value, verify_after, remount_rw,
+                                     PayloadViolation)
+    cmd = literal("echo", "a b", "$(id)")
+    assert "'a b'" in cmd and "'$(id)'" in cmd  # quoted on OUR side
+    for bad in ("echo $HOME", "x=$(id)", "cat ${F}", "echo `id`",
+                "echo $((1+1))"):
+        try:
+            assert_literal(bad)
+            raise AssertionError(f"should reject: {bad}")
+        except PayloadViolation:
+            pass
+    w = marker_wrap("echo hi", marker="T", label="s")
+    assert "__T_s_BEGIN__" in w and "rc=$?" in w
+    assert marker_value("junk __T_s_BEGIN__hello__T_s_END__ rc=0", "T", "s") \
+        == "hello"
+    v = verify_after("mount -o remount,rw /host/root", "grep x", expect="rw")
+    assert v["expect"] == "rw"
+    r = remount_rw("/host/root")   # remount prints NOTHING on success
+    assert "remount,rw" in r["cmd"] and "/proc/mounts" in r["verify"]
+
+
+def test_payload_nspid_and_nscheck():
+    from shardreaper.payload import parse_nspid, ns_check, HOST_USERNS_INODE
+    assert parse_nspid("Name:\tsh\nNSpid:\t1234\t7\n") == [1234, 7]  # nested ns
+    assert parse_nspid("NSpid:\t1234\n") == [1234]
+    r = ns_check()   # linux smoke — never raises
+    assert "nspid" in r and "pod_side_effects_trustworthy" in r
+    assert isinstance(HOST_USERNS_INODE, str)
+
+
+def test_safe_kill_and_pkill_audit():
+    from shardreaper.payload import safe_kill, bracket, audit_pkill, harden_pkill
+    assert safe_kill("malware") == ["pkill", "-f", "[m]alware"]
+    assert bracket("x") == "[x]"
+    assert audit_pkill("pkill -f [o]ldproc") == []
+    v = audit_pkill("pkill -f shardreaper-agent")
+    assert v and "unbracketed" in v[0][1]
+    cmd, n = harden_pkill("pkill -f shardreaper-agent; pkill -f '[k]ept'")
+    assert n == 1 and "pkill -f [s]hardreaper-agent" in cmd
+    assert "'[k]ept'" in cmd
+    # variable-derived pattern cannot be safely bracketed -> left for the ban
+    cmd2, n2 = harden_pkill("pkill -f $PID")
+    assert n2 == 0 and audit_pkill(cmd2)
+
+
+def test_report_merge_never_clobbers():
+    from shardreaper.report import (merge_report, is_empty_template_section,
+                                    narrative_present)
+    old = ("# R\n## 2. Findings\n\n### F001 — RCE `HIGH`\n"
+           "- **Detail:** real narrative\n\n## 4. Attack Plan\n\n- `HIGH` do-x")
+    new = ("# R\n## 2. Findings\n\n_No confirmed findings yet — attack phase "
+           "pending or target hardened._\n\n## 3. Targets & Intel\n\nfresh intel")
+    m = merge_report(old, new)
+    assert "F001" in m and "real narrative" in m      # narrative preserved
+    assert "fresh intel" in m                          # new section added
+    assert "## 4. Attack Plan" in m and "do-x" in m    # old-only section kept
+    assert narrative_present(old) and not narrative_present(new)
+    assert is_empty_template_section("_No plan items._")
+    assert not is_empty_template_section("real content")
+
+
+def test_memory_checkpoint_full_findings():
+    from shardreaper import memory
+    findings = [{"id": "F001", "severity": "critical",
+                 "class": "credential-valid", "title": "kubelet token",
+                 "target": "10.0.0.9", "technique": "T1078"}]
+    memory.checkpoint("eng-full", "spray",
+                      [{"id": "F001", "severity": "critical",
+                        "title": "kubelet token"}], [], [],
+                      findings=findings)
+    roll = memory._rollup("_engagement_eng-full")
+    ck = roll["checkpoints"][-1]
+    assert ck["phase"] == "spray" and ck["findings"] == 1
+    assert roll["checkpoint_findings"]["F001"]["class"] == "credential-valid"
+
+
+def test_rack_structural_check():
+    from shardreaper.rackcheck import (structural_check_src, rack_check)
+    bad = "def outer():\n    def inner():\n        pass\n    return inner\n"
+    assert any("nested" in v for v in structural_check_src(bad, "bad.py"))
+    assert structural_check_src("def fine():\n    return 1\n", "ok.py") == []
+    pkg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "shardreaper")
+    report = rack_check(package_dir=pkg)
+    assert report["structural_ok"], \
+        f"nested defs in rack: {report['structural_violations']}"
+
+
+def test_recon_smoke():
+    """Recon regression smoke: a live local HTTP surface must be discovered
+    end-to-end through the real pipeline (resolve -> port scan -> HTTP probe)."""
+    import http.server
+    import socketserver
+    import threading
+    from shardreaper.recon import run_recon
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Server", "smoke")
+            self.end_headers()
+            self.wfile.write(b"<html><title>SR smoke</title></html>")
+
+        def log_message(self, *a):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        scope = Scope(["127.0.0.1"], [], seeds=["127.0.0.1"], name="smoke")
+        targets = run_recon(scope, ["127.0.0.1"], ports=[port], top_ports=5,
+                            osint=False, paths=False)
+        assert targets, "recon produced no targets"
+        t0 = targets[0]
+        assert port in (t0.get("ports") or {}), \
+            f"port {port} not detected: {t0.get('ports')}"
+        assert any(u.get("status") == 200 for u in t0.get("urls", [])), \
+            "http probe missed the 200"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
 if __name__ == "__main__":
     import traceback
     failed = 0

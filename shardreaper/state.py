@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 # ATT&CK-style phase order the engine walks
 PHASES = [
     "engage", "recon", "analyze", "plan", "attack",
-    "escalate", "persist", "move", "harvest", "evade", "exfil", "report",
+    "escalate", "persist", "move", "harvest", "spray",
+    "evade", "exfil", "report",
 ]
 
 
@@ -40,6 +41,7 @@ class Engagement:
             "seeds": [],
             "targets": [],          # discovered live hosts
             "findings": [],         # confirmed findings
+            "credentials": [],      # harvested credentials (token spray feed)
             "intel": {},            # per-host intel
             "plan": [],             # attack plan items
             "actions": [],          # executed techniques
@@ -94,6 +96,22 @@ class Engagement:
         self.phase = phase
         self.state["phase"] = phase
         self.save()
+
+    def add_credential(self, type_, value, user=None, source=None, note=None):
+        """Add a harvested credential to the spray feed. Deduplicated by
+        (type, value) — the spray phase auto-fires the whole set against
+        every authenticated surface."""
+        if not value:
+            return None
+        for c in self.state.setdefault("credentials", []):
+            if c.get("type") == type_ and c.get("value") == value:
+                return c
+        cred = {"type": type_, "value": value, "user": user,
+                "source": source, "note": note, "ts": now_iso()}
+        self.state["credentials"].append(cred)
+        self.save()
+        self.log(f"credential held: {type_} ({source or 'operator'})", level="action")
+        return cred
 
     # ---------------- loading ----------------
     @classmethod

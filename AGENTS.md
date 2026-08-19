@@ -117,4 +117,38 @@ These are LAW, not advice. Each is enforced by tooling where possible:
    out of a win.
 10. **Checkpoint the ledger after every phase.** Proven findings and
     ruled-out techniques land in cross-engagement memory automatically —
-    never re-prove, never re-waste.
+    never re-prove, never re-waste. (Checkpoints are written even when a
+    phase crashes, and `shardreaper report` merges instead of overwriting —
+    a narrative is never clobbered by the empty template.)
+11. **Spray every credential everywhere.** A harvested password/SA-token/JWT
+    is not a trophy — it is ammunition. Fire it automatically against every
+    authenticated surface on the box: kubelet /pods + exec, apiserver,
+    registry APIs, SSH, docker socket, with all protocol variants (Bearer,
+    Basic, X-Api-Key, cookie, query param). The kubelet miss — a token that
+    only got tested on the web app — is the canonical loss this kills.
+    (`shardreaper spray`; auto phase `spray` after `harvest`.)
+12. **Authn ≠ authz; 400 ≠ 403 ≠ 500.** A 401 triggers an automatic retry
+    with every held credential. A 403 whose body talks about websocket/
+    subprotocol is a PROTOCOL mismatch, never an RBAC denial; a 403 with
+    RBAC markers proves the credential AUTHENTICATED. Collapsing these cost
+    a cluster path. (Enforced: `spray.classify_response`.)
+13. **Probe the exec contract in the fixed order: side-effect FIRST, then
+    entrypoints, then read the source.** Write a marker and read it back
+    before believing any exec works; enumerate /bin/sh, /bin/ash, busybox
+    second; once any shell exists, read /proc/self/mountinfo, cgroup, the SA
+    token and cmdline instead of black-box guessing contracts.
+    (Enforced: `k8s.probe_exec_contract`, `k8s.canned_chain`.)
+14. **Payloads cross boundaries as inline literals — and every
+    state-changing command is marker-wrapped and verify-flagged.** No shell
+    variables expand across the exec boundary. `mount -o remount,rw` prints
+    NOTHING on success — verify via /proc/mounts. Check NSpid/userns before
+    trusting pod-side effects as host-side effects. (Enforced:
+    `payload.assert_literal`, `payload.marker_wrap`, `payload.remount_rw`,
+    `payload.ns_check`.)
+15. **Never let pkill kill the caller.** `pkill -f` matches its own command
+    line. `safe_kill` auto-brackets the pattern; raw unbracketed `pkill -f`
+    is BANNED in rack scripts. And the rack is only "fixed" when it is
+    tested: the healthcheck runs an AST structural check (no methods nested
+    inside module functions) and the test suite carries a live recon smoke
+    test. (Enforced: `payload.safe_kill`, atomics execution gate,
+    `shardreaper rack-check`.)

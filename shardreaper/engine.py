@@ -290,6 +290,50 @@ class Engine:
                                         "kb": kb, "weapons": [w["name"] for w in weapons[:8]]})
         self.eng.save()
 
+    def phase_spray(self):
+        """Token spray (lesson 11): every held credential automatically
+        fired against every authenticated surface on the box — kubelet,
+        apiserver, registry, SSH, docker socket, discovered HTTP — with all
+        protocol variants. The kubelet miss is the canonical case this
+        phase exists to kill."""
+        self.eng.set_phase("spray")
+        from .spray import load_credentials, spray, hit_severity
+        creds = load_credentials(self.eng)
+        if not creds:
+            self.eng.log("spray: no held credentials — harvest first, then "
+                         "re-run this phase", "warn")
+            return
+        self.eng.log(f"spray: {len(creds)} held credential(s) — firing against "
+                     f"every authenticated surface", "action")
+        result = spray(self.eng, creds, log=self.eng.log, ssh=not self.mock)
+        self.eng.state["spray"] = result
+        for hit in result.get("hits", []):
+            cred = hit.get("credential") or "unauthenticated"
+            sev = hit_severity(hit)
+            technique = "T1078 Valid Accounts" if hit.get("credential") \
+                else "T1528 Steal Application Access Token"
+            detail = (f"{hit['surface']} [{hit.get('status')}] "
+                      f"{hit.get('class')} via {hit.get('form', 'anonymous')} "
+                      f"cred={cred}")
+            self.eng.log_action(technique=technique, target=hit["surface"],
+                                detail=detail, outcome="confirmed",
+                                evidence=[hit.get("label", "")[:160]])
+            key = [hit["surface"], cred]
+            if key not in self.eng.state.setdefault("spray_findings", []):
+                self.eng.state["spray_findings"].add(key)
+                self.eng.add_finding(
+                    f"valid credential on {hit['surface']}", sev,
+                    "credential-valid", technique, hit["surface"],
+                    evidence=[detail], detail=detail,
+                    impact="authenticated access to the target surface — "
+                           "chain into exec/persistence immediately",
+                    remediation="revoke/rotate the credential and audit its "
+                                "use on every surface")
+        self.eng.save()
+        self.eng.log(f"spray: {len(result.get('hits', []))} hit(s) from "
+                     f"{result.get('probes', 0)} probes", "win"
+                     if result.get("hits") else "info")
+
     def phase_report(self):
         self.eng.set_phase("report")
         md = render_report(self.eng, self.kb)
@@ -302,36 +346,62 @@ class Engine:
     # ---------------- driver ----------------
     def run(self):
         for phase in self._phase_order:
-            if phase == "recon":
-                self.phase_recon()
-            elif phase == "analyze":
-                self.phase_analyze()
-            elif phase == "plan":
-                self.phase_plan()
-            elif phase == "attack":
-                self.phase_attack()
-            elif phase == "report":
-                self.phase_report()
-            elif phase in PHASE_TECH_KEYWORDS:
-                self.phase_tactical(phase, phase)
-            else:
-                self.eng.log(f"unknown phase {phase}", "err")
-            self._checkpoint(phase)
+            error = None
+            try:
+                if phase == "recon":
+                    self.phase_recon()
+                elif phase == "analyze":
+                    self.phase_analyze()
+                elif phase == "plan":
+                    self.phase_plan()
+                elif phase == "attack":
+                    self.phase_attack()
+                elif phase == "spray":
+                    self.phase_spray()
+                elif phase == "report":
+                    self.phase_report()
+                elif phase in PHASE_TECH_KEYWORDS:
+                    self.phase_tactical(phase, phase)
+                else:
+                    self.eng.log(f"unknown phase {phase}", "err")
+            except Exception as e:  # the ledger must checkpoint even on a crash
+                error = f"{type(e).__name__}: {e}"
+                self.eng.log(f"phase {phase} FAILED — {error}", "err")
+            finally:
+                self._checkpoint(phase, error=error)
         self.eng.log("engine complete")
 
-    def _checkpoint(self, phase):
-        """Post-Cobblestone lesson 10: checkpoint the ledger after every phase."""
+    def _checkpoint(self, phase, error=None):
+        """Post-Cobblestone lesson 10: checkpoint the ledger after every
+        phase — including a phase that crashed. Full findings are persisted
+        both to cross-engagement memory and to an engagement-local snapshot
+        so a resumed run never re-proves a finding or re-wastes a technique."""
         try:
             from . import memory
-            proven = [{"id": f["id"], "severity": f.get("severity"),
-                       "title": f.get("title", "")[:80]}
-                      for f in self.eng.state.get("findings", [])]
-            ruled = sorted({a.get("technique") for a in self.eng.state.get("actions", [])
+            findings = self.eng.state.get("findings", [])
+            proven = [{"id": f.get("id"), "severity": f.get("severity"),
+                       "title": f.get("title", "")[:80]} for f in findings]
+            full = [{"id": f.get("id"), "severity": f.get("severity"),
+                     "class": f.get("class"), "title": f.get("title", "")[:80],
+                     "target": f.get("target"),
+                     "technique": f.get("technique")} for f in findings]
+            ruled = sorted({a.get("technique") for a in
+                            self.eng.state.get("actions", [])
                             if a.get("outcome") in ("dry-run", "planned", "failed")})
+            open_items = [p.get("action") for p in
+                          self.eng.state.get("plan", [])][:12]
+            creds = self.eng.state.get("credentials", [])
             memory.checkpoint(self.eng.state.get("name", "engagement"), phase,
-                              proven, ruled,
-                              open_items=[p.get("action") for p in
-                                          self.eng.state.get("plan", [])][:12])
+                              proven, ruled, open_items, findings=full)
+            snap_dir = os.path.join(self.base, "checkpoints")
+            os.makedirs(snap_dir, exist_ok=True)
+            snap = {"phase": phase, "error": error, "findings": full,
+                    "ruled_out": ruled, "open": open_items,
+                    "credentials": len(creds),
+                    "updated": self.eng.state.get("updated")}
+            with open(os.path.join(snap_dir, f"{phase}.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(snap, f, indent=1)
         except Exception:
             pass
 
@@ -511,7 +581,7 @@ def build_arg_parser(sub):
     rp = sub.add_parser("run", help="run engagement phases")
     rp.add_argument("dir", help="engagement folder")
     rp.add_argument("--phases", default="", help="comma list: recon,analyze,plan,attack,"
-                    "escalate,persist,move,harvest,evade,exfil,report")
+                    "escalate,persist,move,harvest,spray,evade,exfil,report")
     rp.add_argument("--go", action="store_true", help="EXECUTE atomic tests (default dry-run)")
     rp.add_argument("--mock", action="store_true")
     rp.add_argument("--wordlist", default=None, help="subdomain wordlist (default: builtin)")

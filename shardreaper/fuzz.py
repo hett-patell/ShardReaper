@@ -15,6 +15,7 @@ The operator supplies the working exfil one-liner; fuzz feeds it names.
 import os
 import re
 import subprocess
+from functools import partial
 
 WEB_WORDLIST = [
     "index.php", "config.php", "config.inc.php", "db.php", "database.php",
@@ -71,6 +72,19 @@ def fuzz_paths(read_check, candidates=None, base_dir="", log=None, stop_after=No
     return found
 
 
+def _read_check(read_cmd, timeout, cand):
+    """The read primitive as a module-level callable (hoisted — the rack
+    structural check bans defs nested inside module functions)."""
+    cmd = read_cmd.replace("{p}", cand)
+    try:
+        p = subprocess.run(["sh", "-c", cmd], capture_output=True,
+                           text=True, timeout=timeout)
+        out = p.stdout.strip()
+        return out if out and p.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
 def cli_fuzz(args):
     # the read primitive: a shell command template with {p} as the candidate
     hits = []
@@ -87,17 +101,9 @@ def cli_fuzz(args):
                 print(f"cannot read refs {src}: {e}")
         words = list(dict.fromkeys(words))
 
-    def check(cand):
-        cmd = args.read_cmd.replace("{p}", cand)
-        try:
-            p = subprocess.run(["sh", "-c", cmd], capture_output=True,
-                               text=True, timeout=args.timeout)
-            out = p.stdout.strip()
-            return out if out and p.returncode == 0 else None
-        except (subprocess.TimeoutExpired, OSError):
-            return None
+    read_check = partial(_read_check, args.read_cmd, args.timeout)
 
-    hits = fuzz_paths(check, words, args.base, log=lambda m: print(f"[fuzz] {m}"))
+    hits = fuzz_paths(read_check, words, args.base, log=lambda m: print(f"[fuzz] {m}"))
     print(f"\n{len(hits)} hit(s) from {len(words)} candidate(s):")
     for h in hits:
         print(f"  {h['path']} ({h['size']} bytes) :: {h['head']}")

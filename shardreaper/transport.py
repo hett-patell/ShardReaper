@@ -75,7 +75,9 @@ def _dns():
 
 
 def healthcheck():
-    """Deterministic transport self-check. Returns dict + printable lines."""
+    """Deterministic transport self-check. Returns dict + printable lines.
+    Also runs the rack structural check (lesson 15): no methods nested
+    inside module functions — the rack is only "fixed" when it is tested."""
     out = {}
     vpn = {}
     for name in VPN_PROCESSES:
@@ -94,6 +96,17 @@ def healthcheck():
     out["gateway_tcp"] = _tcp_probe(gw, 53) if gw else False
     out["gateway_tcp22"] = _tcp_probe(gw, 22) if gw else False
     out["dns"] = _dns()
+    # rack structural check: nested defs are where a previous pass stashed
+    # a helper the runner never re-discovers — cost us real engagement time
+    try:
+        from .rackcheck import rack_check
+        report = rack_check()
+        out["rack"] = {"violations": report["structural_violations"],
+                       "pkill_violations": report["pkill_violations"],
+                       "ok": report["structural_ok"] and report["pkill_ok"]}
+    except Exception as e:
+        out["rack"] = {"violations": [], "pkill_violations": [],
+                       "ok": False, "error": str(e)}
     return out
 
 
@@ -106,6 +119,14 @@ def format_health(report):
     lines.append(f"  gateway tcp/53: {'up' if report['gateway_tcp'] else 'DOWN'} · "
                  f"tcp/22: {'up' if report['gateway_tcp22'] else 'DOWN'}")
     lines.append(f"  dns: {'up' if report['dns'] else 'DOWN'}")
+    rack = report.get("rack", {})
+    if rack:
+        lines.append(f"  rack structure: "
+                     f"{'CLEAN' if rack.get('ok') else f'{len(rack.get('violations', []))} nested-def + {len(rack.get('pkill_violations', []))} raw-pkill violation(s)'}")
+        for v in rack.get("violations", [])[:5]:
+            lines.append(f"    !! {v}")
+        for v in rack.get("pkill_violations", [])[:5]:
+            lines.append(f"    !! raw pkill -f: {v.get('source')} {v.get('pattern')}")
     verdict = []
     if not report["vpn_processes"] and not report["tun_present"]:
         verdict.append("no VPN process and no tunnel interface — if this "

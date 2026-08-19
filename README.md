@@ -3,7 +3,7 @@
 
 # ShardReaper
 
-> A self-contained, autonomous red team operator · **12-phase kill chain** · **1,819 executable ATT&CK tests** · **2,700+ technique playbooks & payload scripts** in an offline knowledge base · **700+ weapon & resource catalog** · deterministic scope gate · cross-engagement memory with resume · platform reports (HackerOne / Bugcrowd / Intigriti) · 7-Question triage gate + full validation · exploit-chain builder · passive OSINT · web3 rug-pull audit · ATT&CK Navigator export · SQLi oracle + encoded exfil · file fuzzing · pure-python crackers · arsenal self-check · canary listener · transport healthcheck · adaptive scan pacing · optional LLM brain · zero runtime dependencies. One shard. Sharpest edge. Total harvest.
+> A self-contained, autonomous red team operator · **13-phase kill chain** · **1,819 executable ATT&CK tests** · **2,700+ technique playbooks & payload scripts** in an offline knowledge base · **700+ weapon & resource catalog** · deterministic scope gate · cross-engagement memory with resume · platform reports (HackerOne / Bugcrowd / Intigriti) · 7-Question triage gate + full validation · exploit-chain builder · passive OSINT · web3 rug-pull audit · ATT&CK Navigator export · SQLi oracle + encoded exfil · file fuzzing · pure-python crackers · arsenal self-check · canary listener · transport healthcheck · token spray with authn/authz differential · kubelet WebSocket exec + canned pod→mount→SSH chain · adaptive scan pacing · optional LLM brain · zero runtime dependencies. One shard. Sharpest edge. Total harvest.
 
 ---
 
@@ -15,7 +15,7 @@ Four layers stack:
 
 - **Think** — the doctrine (`AGENTS.md`) + the `shardreaper-core` skill: absolute obedience to the operator, aggression as the default state, APT tradecraft, and evidence before claims. Loaded first, obeyed always.
 - **Know** — an offline knowledge base of **2,760 technique playbooks, payload scripts, deep-dive writeups, reversing notes and lab configurations** covering Windows, Linux, web, cloud, Active Directory, evasion, reversing, and more — indexed locally, searched in milliseconds, ranked hits with exact paths. No network, no API, nothing leaves the machine.
-- **Strike** — the deterministic engine: **12 phases** from recon to report · **341 techniques / 1,819 executable ATT&CK tests** rendered and fired from the local rack (dry-run by default, `--go` executes) · a **709-entry phase-indexed weapon & resource catalog** (tools, tips, technique writeups — with install commands where available) · a stdlib-first recon arsenal (DNS/AXFR/subdomain brute, port sweep with banners, TLS inspection, HTTP fingerprinting, sensitive-path probing, CORS and security-header checks).
+- **Strike** — the deterministic engine: **13 phases** from recon to report · **341 techniques / 1,819 executable ATT&CK tests** rendered and fired from the local rack (dry-run by default, `--go` executes) · a **709-entry phase-indexed weapon & resource catalog** (tools, tips, technique writeups — with install commands where available) · a stdlib-first recon arsenal (DNS/AXFR/subdomain brute, port sweep with banners, TLS inspection, HTTP fingerprinting, sensitive-path probing, CORS and security-header checks).
 - **Ship** — the audit ledger, captured evidence, and `REPORT.md`: findings with severity, class, ATT&CK mapping, and exact next moves. Chains, not checklists. Platform submissions render per program — HackerOne (weakness/severity/steps/impact), Bugcrowd (VRT-mapped), Intigriti (impact-first) — and only findings that passed the 7-Question Gate get shipped.
 
 The operator layer never forgets: a cross-engagement memory ledger captures every confirmed finding, every tested technique that paid nothing, and every operator note — so `pickup` resumes a target exactly where the last run stopped, and `autopilot` drives the loop from that point to report with configurable checkpoints. Everything is deterministic by default — the scope gate is enforced in code on every single action, and the engine runs fully offline. An optional LLM brain (any OpenAI-compatible endpoint) advises on attack planning; the code still gates everything it does.
@@ -99,7 +99,7 @@ Beyond the kill chain, ShardReaper carries the full operator toolkit:
 ## Field lessons — hardened on HTB Cobblestone
 
 ShardReaper failed its first real machine, took the writeup, and turned every
-failure into code. The ten lessons are now LAW (see `AGENTS.md` §8):
+failure into code. The fifteen lessons are now LAW (see `AGENTS.md` §8):
 
 | # | Lesson | Enforced by |
 |---|---|---|
@@ -112,21 +112,26 @@ failure into code. The ten lessons are now LAW (see `AGENTS.md` §8):
 | 7 | Prove the arsenal works before the engagement | `arsenal` — runs at every `engage`; `crack` is the pure-python fallback ($1$/$5$/$6$ + raw, ground-truthed against system crypt) |
 | 8 | Pace scans; back off on filtered ratios | adaptive pacing in `recon` — pause/backoff/stop on answer-ratio collapse |
 | 9 | Bias to action | doctrine — a canary is cheaper than a spec debate |
-| 10 | Checkpoint the ledger after every phase | automatic in `engine.run()` — proven/ruled-out land in cross-engagement memory |
+| 10 | Checkpoint the ledger after every phase | automatic in `engine.run()` — full findings land in cross-engagement memory + engagement-local snapshots, even when a phase crashes; `report` merges, never clobbers |
+| 11 | Spray every credential everywhere | `spray` — every password/SA-token/JWT × kubelet/apiserver/registry/SSH/docker with all protocol variants |
+| 12 | Authn ≠ authz; 400 ≠ 403 ≠ 500 | `spray.classify_response` — 401 auto-retries all held creds; 403-with-subprotocol-mismatch is never RBAC |
+| 13 | Exec contract: side-effect probe first, then source | `kube probe` — marker round-trip before entrypoints; /proc/mountinfo, cgroup, SA token over black-box guessing |
+| 14 | Literal payloads; verify flags after silent state changes | `payload` — no cross-boundary shell expansion, BEGIN/END markers, /proc/mounts rw-flag verify, NSpid/userns proof |
+| 15 | pkill must never kill the caller; fixed = tested | `safe_kill` brackets patterns, raw `pkill -f` banned at execution; `rack-check` AST check + live recon smoke test |
 
 ---
 
 ## How it works
 
-A 12-phase kill chain — `engage → recon → analyze → plan → attack →
-escalate → persist → move → harvest → evade → exfil → report` — with scope
-enforced in code at every boundary.
+A 13-phase kill chain — `engage → recon → analyze → plan → attack →
+escalate → persist → move → harvest → spray → evade → exfil → report` — with
+scope enforced in code at every boundary.
 
 - **engage** — the operator authorizes the scope (the only gate), seeds, and objective.
 - **recon / analyze / plan** — surface mapping, service hints, ranked attack items with techniques attached. Exposed sensitive files become HIGH findings with captured evidence immediately.
 - **attack** — fires the selected ATT&CK tests. Dry-run by default; `--go` executes.
-- **escalate / persist / move / harvest / evade / exfil** — tactical phases that pull the right playbooks, atomics, and weapons for each chain step.
-- **report** — `REPORT.md` with findings, evidence, and next moves. Every action lands in a JSONL audit ledger; a run is resumable and auditable.
+- **escalate / persist / move / harvest / spray / evade / exfil** — tactical phases that pull the right playbooks, atomics, and weapons for each chain step; `spray` auto-fires every harvested credential against every authenticated surface.
+- **report** — `REPORT.md` with findings, evidence, and next moves. Merges with any existing report and never clobbers a narrative with the empty template. Every action lands in a JSONL audit ledger; a run is resumable and auditable.
 
 Two ways to drive it: plain English through a skill-aware agent, or the CLI directly.
 
@@ -171,17 +176,18 @@ for the full posture.
 | Kill-chain phases | 8 | `shardreaper-recon` · `-attack` · `-persist` · `-privesc` · `-credharvest` · `-lateral` · `-evasion` · `-exfil-c2` |
 | Operator layer | 3 | `shardreaper-osint` · `shardreaper-report` · `shardreaper-web3` |
 
-**32 slash commands**: `engage`, `hunt`, `scope`, `recon`, `kb`, `classify`,
+**35 slash commands**: `engage`, `hunt`, `scope`, `recon`, `kb`, `classify`,
 `plan`, `attack`, `escalate`, `harvest`, `exfil`, `report`, `autopilot`,
 `pickup`, `remember`, `memory-gc`, `triage`, `validate`, `chain`, `surface`,
 `intel`, `map`, `osint`, `token-scan`, `web3-audit`, `status`, `sqli`, `fuzz`,
-`crack`, `arsenal`, `canary`, `healthcheck` — one per operator move.
+`crack`, `arsenal`, `canary`, `healthcheck`, `spray`, `kube`, `rack-check` —
+one per operator move.
 
 **The engine** — deterministic, resumable, auditable:
 
 | Module | Role |
 |---|---|
-| `engine.py` | 12-phase orchestrator + autopilot |
+| `engine.py` | 13-phase orchestrator + autopilot |
 | `scope.py` | deterministic scope gate (deny-wins, default-deny) |
 | `knowledge.py` | offline corpus router — 2,760 docs, ranked search |
 | `atomics.py` | 341 techniques / 1,819 executable ATT&CK tests + Navigator export |
@@ -194,7 +200,11 @@ for the full posture.
 | `persona.py` | the operator doctrine, injected everywhere |
 | `llm.py` | optional OpenAI-compatible brain |
 | `state.py` | engagement ledger + resumable state |
-| `report.py` | client deliverable + H1/Bugcrowd/Intigriti submissions |
+| `report.py` | client deliverable + H1/Bugcrowd/Intigriti submissions + merge |
+| `k8s.py` | kubelet WebSocket exec (v4/v5 channel framing) + canned pod→mount→remount→SSH chain + exec-contract probe |
+| `spray.py` | token spray + authn/authz differential classifier (400/401/403/404/500) |
+| `payload.py` | literal payload discipline, markers + verify flags, NSpid/userns proof, `safe_kill` |
+| `rackcheck.py` | rack regression gate: AST structural check + pkill audit |
 
 ---
 
@@ -204,10 +214,10 @@ for the full posture.
 |---|---|
 | [`README.md`](README.md) | This file — overview, quickstart, how it works |
 | [`AGENTS.md`](AGENTS.md) | The doctrine — identity and law |
-| [`commands/`](commands/) | 25 slash commands |
+| [`commands/`](commands/) | 28 slash commands |
 | [`skills/`](skills/) | 12 phase skills in SKILL.md format |
 | [`templates/`](templates/) | Engagement + report templates, Burp MCP config example |
-| [`tests/`](tests/) | 56 self-tests, all green |
+| [`tests/`](tests/) | 69 self-tests, all green |
 | [`SECURITY.md`](SECURITY.md) | Authorized-use posture |
 | [`LICENSE`](LICENSE) | MIT |
 
@@ -234,7 +244,7 @@ it. The reaper harvests what remains after.
 
 ## Roadmap
 
-- [x] 12-phase engine · deterministic scope gate · offline knowledge base
+- [x] 13-phase engine · deterministic scope gate · offline knowledge base
 - [x] ATT&CK execution rack with dry-run/`--go` · weapon catalog
 - [x] Optional OpenAI-compatible LLM brain (persona + ROE always injected)
 - [x] Cross-engagement memory ledger · pickup/remember/autopilot
@@ -245,6 +255,7 @@ it. The reaper harvests what remains after.
 - [x] Full reference integration — 2,760-doc knowledge base, 709-entry catalog with install blocks, payload scripts, reversing/lab notes
 - [x] Hunt scaffold (scope.md + workspace) · ATT&CK Navigator export · report redaction
 - [x] Field-lesson hardening (HTB Cobblestone): encoded exfil, file fuzzing, canary listener, transport healthcheck, SQLi oracle self-test, magic variants, arsenal self-check, pure-python crackers, adaptive scan pacing, per-phase ledger checkpoints
+- [x] v1.2 strike extensions: token spray with authn/authz differential (401 auto-retry, 403-protocol-mismatch ≠ RBAC), kubelet WebSocket exec (v4/v5 channel framing) + canned pod→mount→remount→SSH chain, exec-contract probe (side-effect first, then source), literal payload discipline with verify flags + NSpid proof, `safe_kill` pkill guard, report merge, rack AST structural check + recon smoke test
 - [ ] Built-in HTTP exploitation primitives (auth-bypass checks, verb tampering)
 - [ ] C2 module (implant wrappers, DNS channel templates)
 - [ ] AD attack-path planning with graph collection

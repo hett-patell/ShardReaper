@@ -230,9 +230,18 @@ class AtomicIndex:
         executor = (test.get("executor") or {}).get("name") or "sh"
         if not cmd:
             return {"ok": False, "error": "empty command", "cmd": ""}
+        # pkill self-match guard: auto-bracket raw patterns, ban the rest
+        from .payload import audit_pkill, harden_pkill
+        cmd, n_hardened = harden_pkill(cmd)
+        residual = audit_pkill(cmd)
+        if residual and not os.environ.get("SHARDREAPER_ALLOW_RAW_PKILL"):
+            return {"ok": False, "error": "BANNED raw pkill -f (self-match "
+                    "guard): " + "; ".join(f"{p}:{r}" for p, r in residual),
+                    "cmd": cmd}
         if dry_run:
             return {"ok": True, "dry_run": True, "cmd": cmd, "executor": executor,
-                    "note": "dry-run: pass --go to execute"}
+                    "note": ("dry-run: pass --go to execute"
+                             + ("; pkill pattern auto-bracketed" if n_hardened else ""))}
         shell = {"sh": "sh -c", "bash": "bash -c", "command_prompt": "cmd /c",
                  "manual": None, "powershell": "powershell -NoProfile -Command",
                  "pwsh": "pwsh -NoProfile -Command", "python": "python3 -c"}.get(executor)
@@ -247,6 +256,7 @@ class AtomicIndex:
                                timeout=timeout, shell=False)
             return {"ok": p.returncode == 0, "cmd": cmd, "executor": executor,
                     "returncode": p.returncode,
+                    "pkill_hardened": bool(n_hardened),
                     "stdout": (p.stdout or "")[-2000:],
                     "stderr": (p.stderr or "")[-2000:]}
         except subprocess.TimeoutExpired:
