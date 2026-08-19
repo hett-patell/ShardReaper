@@ -1,0 +1,10 @@
+{
+  "name": "engagement",
+  "in_scope": [
+    "example.com"
+  ],
+  "out_of_scope": [],
+  "seeds": [
+    "http://example.com"
+  ]
+}

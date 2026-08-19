@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redagent"
+version = "1.0.0"
+description = "RedAgent — a complete, aggressive autonomous red team agent. Engages targets, routes the local offensive corpus (Atomic Red Team, HackTricks, ired.team, BugHunter, tool catalogs), runs recon, executes techniques, and produces operator-ready reports."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "RedAgent" }]
+keywords = ["red-team", "offensive-security", "pentest", "att&ck", "agent", "adversary-simulation"]
+dependencies = []
+
+[project.optional-dependencies]
+# everything is stdlib-first; these are optional accelerators
+http = ["requests"]
+yaml = ["PyYAML"]
+
+[project.scripts]
+redagent = "redagent.cli:main"
+
+[tool.setuptools]
+packages = ["redagent"]
+
+[tool.setuptools.package-data]
+redagent = ["data/*.json", "data/wordlists/*.txt"]
