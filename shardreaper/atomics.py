@@ -150,11 +150,15 @@ class AtomicIndex:
 
         strict=True counts only test-name and technique-name matches (no
         description hits) — used by the engine so generic words like "web"
-        cannot drag in loosely-related tests.
+        cannot drag in loosely-related tests. Multi-word keywords are treated
+        as phrases (higher weight); single words match on word boundaries.
         """
         kw = [k.lower() for k in (keywords or [])]
+        phrases = [k for k in kw if " " in k]
+        singles = [k for k in kw if " " not in k]
         picked = []
         for tid, tech in self._load().items():
+            tname = tech["display_name"].lower()
             for t in tech["tests"]:
                 name = (t.get("name") or "").lower()
                 desc = (t.get("description") or "").lower()
@@ -164,10 +168,16 @@ class AtomicIndex:
                     picked.append((0, tid, t))
                     continue
                 s = 0
-                for k in kw:
-                    if k in name:
+                for p in phrases:
+                    if p in name:
+                        s += 4
+                    elif p in tname:
                         s += 3
-                    elif k in tech["display_name"].lower():
+                for k in singles:
+                    pat = re.compile(r"\b" + re.escape(k) + r"\b")
+                    if pat.search(name):
+                        s += 3
+                    elif pat.search(tname):
                         s += 2
                     elif not strict and k in desc:
                         s += 1

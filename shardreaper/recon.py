@@ -61,6 +61,15 @@ TECH_PATTERNS = [
 MISSING_HEADERS = ["strict-transport-security", "content-security-policy",
                    "x-frame-options", "x-content-type-options", "x-xss-protection"]
 
+# Burp (or any intercepting proxy) — set SHARDREAPER_PROXY=http://127.0.0.1:8080
+# and every HTTP request flows through it (CONNECT tunnel for HTTPS).
+PROXY = os.environ.get("SHARDREAPER_PROXY", "") or None
+
+
+def _parse_proxy(proxy):
+    p = urlparse(proxy if "://" in proxy else "http://" + proxy)
+    return p.hostname, (p.port or 8080)
+
 
 class Recon:
     def __init__(self, scope, timeout=3.0, workers=32, log=None):
@@ -223,10 +232,19 @@ class Recon:
                 "Accept": "*/*"}
         if headers:
             hdrs.update(headers)
-        conn = cls(host, port, timeout=timeout or self.timeout)
-        path = u.path or "/"
-        if u.query:
-            path += "?" + u.query
+        if PROXY:
+            ph, pp = _parse_proxy(PROXY)
+            conn = cls(ph, pp, timeout=timeout or self.timeout)
+            if u.scheme == "https":
+                conn.set_tunnel(host, port)     # CONNECT through the proxy
+            path = url if u.scheme == "http" else (u.path or "/")
+            if u.scheme != "http" and u.query:
+                path += "?" + u.query
+        else:
+            conn = cls(host, port, timeout=timeout or self.timeout)
+            path = u.path or "/"
+            if u.query:
+                path += "?" + u.query
         conn.request(method, path, body=body, headers=hdrs)
         resp = conn.getresponse()
         data = resp.read(20000)
@@ -367,12 +385,21 @@ class Recon:
 
 # ---------------- orchestrated recon run ----------------
 def run_recon(scope, seeds, wordlist=None, ports=None, top_ports=100, workers=32,
-              log=None, include_external=True, paths=True):
+              log=None, include_external=True, paths=True, osint=True):
     """Full recon sweep over in-scope seeds. Returns targets list for state."""
     log = log or (lambda *a, **k: None)
     r = Recon(scope, workers=workers, log=log)
     targets = []
     seen_hosts = set()
+
+    # passive scope expansion first (crt.sh / subfinder / assetfinder), then sweep
+    if osint:
+        try:
+            from .osint import osint_expand
+            extra = osint_expand(scope, seeds, log=log, resolve=r.resolve)
+            seeds = list(seeds) + [h for h in extra if h not in seeds]
+        except Exception:
+            pass
 
     for seed in seeds:
         host = urlparse(seed if "://" in seed else "//" + seed).hostname or seed
@@ -457,7 +484,7 @@ def run_recon(scope, seeds, wordlist=None, ports=None, top_ports=100, workers=32
     # subdomain brute on the apex domain of each seed (cheap, in-scope only)
     for seed in seeds:
         host = urlparse(seed if "://" in seed else "//" + seed).hostname or seed
-        if host.count(".") >= 2 and not host.replace(".", "").isdigit():
+        if host.count(".") >= 1 and not host.replace(".", "").isdigit():
             domain = host
             subs = r.subdomain_brute(domain, wordlist or "", limit=800)
             if subs:

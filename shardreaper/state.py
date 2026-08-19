@@ -83,6 +83,11 @@ class Engagement:
         self.state["findings"].append(finding)
         self.save()
         self.log(f"{fid} {severity.upper()} {title} @ {target}", level="win")
+        try:  # cross-engagement memory capture — never breaks the run
+            from . import memory
+            memory.log_finding(self.state.get("name", "engagement"), target, finding)
+        except Exception:
+            pass
         return finding
 
     def set_phase(self, phase):

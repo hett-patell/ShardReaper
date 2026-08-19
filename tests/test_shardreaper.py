@@ -7,6 +7,10 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# keep the memory ledger hermetic during tests
+os.environ.setdefault("SHARDREAPER_MEMORY_DIR",
+                      tempfile.mkdtemp(prefix="shardreaper-mem-test-"))
+
 from shardreaper.scope import Scope, OutOfScopeError
 from shardreaper.state import Engagement
 from shardreaper.knowledge import Knowledge, corpus_roots
@@ -338,6 +342,198 @@ def test_report_renders_findings():
         assert "F001" in md and "HIGH" in md and "F002" in md and "LOW" in md
         assert "attack.mitre.org" in md
 
+
+
+
+# ---------------- memory / resume ----------------
+def test_memory_roundtrip():
+    from shardreaper import memory
+    memory.log_finding("eng-a", "tgt.local", {"id": "F001", "severity": "high",
+                                              "class": "idor", "title": "T1",
+                                              "technique": "T1005"})
+    memory.log_negative("tgt.local", "T1059", "no exec")
+    memory.log_note("tgt.local", "WAF resets sessions")
+    memory.touch_session("tgt.local", "eng-a")
+    text = memory.pickup("tgt.local")
+    assert "T1" in text and "high" in text
+    assert "T1059" in text and "WAF resets sessions" in text
+    assert "eng-a" in text
+    # finding capture fires automatically from state
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engagement(d, "eng-b")
+        eng.add_finding("auto captured", "medium", "xss", "T1059.007",
+                        "tgt2.local", ["ev"], "d")
+        assert "auto captured" in memory.pickup("tgt2.local")
+
+
+def test_memory_gc():
+    from shardreaper import memory
+    assert "findings.jsonl" in memory.gc(rotate=True)
+
+
+# ---------------- web3 token-scan ----------------
+EVM_FIXTURE = """
+contract RugToken {
+    address owner;
+    function mint(address to, uint256 amount) public { }   // hidden mint
+    function setFee(uint256 f) external { fee = f; }       // uncapped fee
+    function renounceOwnership() public onlyOwner { }      // fake renounce
+    function rug() external { selfdestruct(payable(owner)); }
+}
+"""
+SOLANA_FIXTURE = """
+pub fn set_mint_authority(ctx: Context<SetMintAuthority>) -> Result<()> {
+    msg!("authority not renounced");
+    Ok(())
+}
+"""
+
+
+def test_token_scan_evm():
+    from shardreaper.tokens import scan_file
+    import tempfile as tf
+    with tf.TemporaryDirectory() as d:
+        p = os.path.join(d, "RugToken.sol")
+        open(p, "w").write(EVM_FIXTURE)
+        hits = scan_file(p)
+    ids = {h["id"] for h in hits}
+    assert "hidden-mint" in ids and "fee-manipulation" in ids
+    assert "fake-renounce" in ids and "selfdestruct" in ids
+    assert all(h["severity"] for h in hits)
+
+
+def test_token_scan_solana():
+    from shardreaper.tokens import scan_file
+    import tempfile as tf
+    with tf.TemporaryDirectory() as d:
+        p = os.path.join(d, "lib.rs")
+        open(p, "w").write(SOLANA_FIXTURE)
+        hits = scan_file(p, chain="solana")
+    assert any(h["id"] == "mint-authority-not-renounced" for h in hits)
+
+
+# ---------------- platform reports ----------------
+def test_report_platforms():
+    from shardreaper.report import render_h1, render_bugcrowd, render_intigriti
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engagement(d, "t1")
+        eng.add_finding("IDOR on orders", "critical", "idor", "T1005",
+                        "api.tgt", ["1. GET /api/orders/1", "2. change id -> 200"],
+                        "read any user's orders")
+        h1 = render_h1(eng)
+        assert "Weakness" in h1 and "Steps to Reproduce" in h1 and "Impact" in h1
+        bc = render_bugcrowd(eng)
+        assert "VRT" in bc and "broken_access_control" in bc
+        it = render_intigriti(eng)
+        assert "Business impact" in it
+
+
+def test_report_skips_gated_killed():
+    from shardreaper.report import render_h1
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engagement(d, "t1")
+        eng.add_finding("killed finding", "low", "xss", "T1059.007",
+                        "t", [], "d")
+        eng.state["findings"][0]["gate"] = {"passed": False, "decision": "kill"}
+        assert "killed finding" not in render_h1(eng)
+
+
+# ---------------- triage / chain / surface / intel / map ----------------
+def test_triage_gate():
+    from shardreaper.analysis import run_gate
+    ok = run_gate({f"q{i}": True for i in range(1, 8)} | {"q6": False})
+    assert ok["passed"] and ok["decision"] == "submit"
+    dup = run_gate({f"q{i}": True for i in range(1, 8)} | {"q6": True})
+    assert not dup["passed"] and dup["decision"] == "kill"
+
+
+def test_triage_command_noninteractive():
+    from shardreaper.analysis import triage
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engagement(d, "t1")
+        eng.add_finding("x", "high", "idor", "T1005", "t", ["e"], "d")
+        out = triage(eng, interactive=False, assume_yes=True)
+        assert out and out[0][1]["passed"]
+        assert eng.state["findings"][0]["gate"]["decision"] == "submit"
+
+
+def test_chain_resolve():
+    from shardreaper.analysis import chain
+    from shardreaper.knowledge import Knowledge
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engagement(d, "t1")
+        eng.add_finding("IDOR on orders", "critical", "idor", "T1005",
+                        "api.tgt", ["ev"], "d")
+        out = chain(eng, Knowledge(), finding_id="F001")
+    assert "F001" in out
+    assert "ato" in out or "mass-data" in out
+
+
+def test_surface_ranking():
+    from shardreaper.analysis import surface
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engagement(d, "t1")
+        eng.state["targets"] = [{"host": "h1", "ports": {22: None, 8080: None},
+                                 "urls": [{"url": "http://h1:8080", "status": 200,
+                                           "tech": []}],
+                                 "intel": {}, "findings": [
+                                     {"severity": "high", "type": "exposed-path",
+                                      "path": "/.env", "detail": "leak"}]}]
+        eng.state["findings"] = [{"id": "F001", "title": "dead", "severity": "low",
+                                  "gate": {"passed": False}}]
+        out = surface(eng)
+    assert "P1" in out and "P2" in out and "KILL LIST" in out
+
+
+def test_map_class():
+    from shardreaper.analysis import map_class
+    from shardreaper.knowledge import Knowledge
+    from shardreaper.weapons import Weapons
+    from shardreaper.atomics import AtomicIndex
+    kb = Knowledge()
+    roots = kb.roots
+    atomics = AtomicIndex(roots["atomic"]) if "atomic" in roots else None
+    weapons = Weapons(roots)
+    out = map_class(kb, atomics, weapons, "kerberos golden ticket")
+    assert "playbooks" in out and "weapons" in out
+
+
+# ---------------- autopilot ----------------
+def test_autopilot_cli():
+    from shardreaper.engine import engage, cli_autopilot
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory() as d:
+        base = os.path.join(d, "eng")
+        engage(base, "ap", ["http://localhost:8000"], ["localhost"], [], "obj")
+        rc = cli_autopilot(SimpleNamespace(dir=base, phases="", mode="yolo",
+                                           go=False, mock=True, yes=True))
+        assert rc == 0
+        eng = Engagement.load(base)
+        assert eng.phase == "report"
+        assert os.path.isfile(os.path.join(base, "REPORT.md"))
+
+
+
+
+def test_osint_expansion_patched():
+    """OSINT expansion with crt.sh patched (no network): scope-filtered + liveness."""
+    from shardreaper import osint as osintmod
+    from shardreaper.scope import Scope
+    osintmod.shutil.which = lambda name: None   # no external tools in tests
+    osintmod.crtsh = lambda apex, timeout=25: {
+        "api.example.com", "dev.example.com", "admin.example.com",
+        "evil.net.example.com", "*.www.example.com",
+    }
+    scope = Scope(["example.com"], ["admin.example.com"], name="osint-test")
+    # liveness: only api + dev resolve
+    live = osintmod.osint_expand(
+        scope, ["example.com"],
+        resolve=lambda h: h in ("api.example.com", "dev.example.com"),
+        log=lambda *a, **k: None)
+    assert "api.example.com" in live
+    assert "dev.example.com" in live
+    assert "admin.example.com" not in live   # out-of-scope rule wins
+    assert "evil.net.example.com" not in live  # no DNS
 
 if __name__ == "__main__":
     import traceback

@@ -119,6 +119,96 @@ def render_report(eng, kb=None):
     return "\n".join(L) + "\n"
 
 
+# ---------------- platform reports (HackerOne / Bugcrowd / Intigriti) ----------------
+VRT_MAP = {
+    "rce": "server_security_misconfiguration",
+    "sqli": "server_security_misconfiguration",
+    "ssrf": "server_side_request_forgery_ssrf",
+    "idor": "broken_access_control",
+    "auth-bypass": "broken_authentication_and_session_management",
+    "xss": "cross_site_scripting_xss",
+    "cors": "cross_origin_resource_sharing_cors",
+    "open-redirect": "unvalidated_redirects_and_forwards",
+    "info-leak": "sensitive_data_exposure",
+    "exposed-path": "sensitive_data_exposure",
+    "weak-credentials": "weak_login_function",
+    "missing-headers": "missing_or_misconfigured_security_headers",
+    "tls": "improper_transport_layer_security",
+    "dns-axfr": "information_disclosure",
+}
+
+
+def render_h1(eng, only_passed=True):
+    """HackerOne markdown submission per finding."""
+    parts = []
+    for f in eng.state.get("findings", []):
+        gate = f.get("gate")
+        if only_passed and gate and not gate.get("passed"):
+            continue
+        parts.append(f"## {f['title']}\n")
+        parts.append("**Weakness:** " + (f.get("class") or ""))
+        parts.append("**Severity:** " + f.get("severity", "").upper())
+        parts.append("**Target:** " + f.get("target", ""))
+        parts.append("")
+        parts.append("### Summary\n")
+        parts.append(f.get("detail", "") + "\n")
+        parts.append("### Steps to Reproduce\n")
+        for i, ev in enumerate(f.get("evidence") or [str(f.get("evidence"))], 1):
+            parts.append(f"{i}. {ev}")
+        parts.append("\n### Impact\n")
+        parts.append(f.get("impact") or "See Summary — concrete attacker-attainable harm described above.")
+        parts.append("")
+    if not parts:
+        parts.append("_No passing findings to submit._")
+    return "\n".join(parts) + "\n"
+
+
+def render_bugcrowd(eng, only_passed=True):
+    """Bugcrowd submission — VRT-mapped."""
+    parts = []
+    for f in eng.state.get("findings", []):
+        gate = f.get("gate")
+        if only_passed and gate and not gate.get("passed"):
+            continue
+        vrt = VRT_MAP.get((f.get("class") or "").lower(), "server_security_misconfiguration")
+        parts.append(f"## {f['title']}\n")
+        parts.append(f"- **VRT:** {vrt}")
+        parts.append(f"- **Severity:** {f.get('severity', '').upper()}")
+        parts.append(f"- **Target:** {f.get('target')}")
+        parts.append(f"- **Description:** {f.get('detail', '')}")
+        parts.append(f"- **Steps to Reproduce:** " + " ; ".join(f.get("evidence") or []))
+        parts.append(f"- **Impact:** {f.get('impact') or 'Demonstrated attacker impact.'}")
+        parts.append("")
+    if not parts:
+        parts.append("_No passing findings to submit._")
+    return "\n".join(parts) + "\n"
+
+
+def render_intigriti(eng, only_passed=True):
+    """Intigriti submission — impact-first."""
+    parts = []
+    for f in eng.state.get("findings", []):
+        gate = f.get("gate")
+        if only_passed and gate and not gate.get("passed"):
+            continue
+        parts.append(f"## {f['title']}\n")
+        parts.append("**Vulnerability class:** " + (f.get("class") or ""))
+        parts.append("**Severity:** " + f.get("severity", "").upper())
+        parts.append("**Endpoint:** " + f.get("target", ""))
+        parts.append("")
+        parts.append("**Description:** " + f.get("detail", ""))
+        parts.append("**Reproduction:** " + " ".join(f.get("evidence") or []))
+        parts.append("**Business impact:** " + (f.get("impact") or "Attacker-attainable harm as described."))
+        parts.append("")
+    if not parts:
+        parts.append("_No passing findings to submit._")
+    return "\n".join(parts) + "\n"
+
+
+PLATFORM_RENDERERS = {"h1": render_h1, "bugcrowd": render_bugcrowd,
+                      "intigriti": render_intigriti}
+
+
 def cli_report(args):
     from .state import Engagement
     base = os.path.abspath(args.dir)
@@ -126,6 +216,13 @@ def cli_report(args):
         print(f"no engagement at {base}")
         return 1
     eng = Engagement.load(base)
+    if args.platform in PLATFORM_RENDERERS:
+        md = PLATFORM_RENDERERS[args.platform](eng)
+        out = os.path.join(base, f"REPORT-{args.platform.upper()}.md")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(md)
+        print(f"{args.platform} report written: {out}")
+        return 0
     md = render_report(eng)
     out = os.path.join(base, "REPORT.md")
     with open(out, "w", encoding="utf-8") as f:
@@ -137,5 +234,8 @@ def cli_report(args):
 def build_arg_parser(sub):
     p = sub.add_parser("report", help="render REPORT.md from engagement state")
     p.add_argument("dir")
+    p.add_argument("--platform", default="client",
+                   choices=["client", "h1", "bugcrowd", "intigriti"],
+                   help="report flavor (client default)")
     p.set_defaults(fn=cli_report)
     return p

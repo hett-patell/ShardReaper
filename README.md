@@ -15,7 +15,7 @@
 
 # shardreaper
 
-> A self-contained, autonomous red team operator · **12-phase kill chain** · **1,819 executable ATT&CK tests** · **1,200+ technique playbooks** in an offline knowledge base · **460+ weapon catalog** · deterministic scope gate · optional LLM brain · zero runtime dependencies. One shard. Sharpest edge. Total harvest.
+> A self-contained, autonomous red team operator · **12-phase kill chain** · **1,819 executable ATT&CK tests** · **1,200+ technique playbooks** in an offline knowledge base · **460+ weapon catalog** · deterministic scope gate · cross-engagement memory with resume · platform reports (HackerOne / Bugcrowd / Intigriti) · 7-Question triage gate · exploit-chain builder · passive OSINT · web3 rug-pull audit · optional LLM brain · zero runtime dependencies. One shard. Sharpest edge. Total harvest.
 
 ---
 
@@ -28,9 +28,9 @@ Four layers stack:
 - **Think** — the doctrine (`AGENTS.md`) + the `shardreaper-core` skill: absolute obedience to the operator, aggression as the default state, APT tradecraft, and evidence before claims. Loaded first, obeyed always.
 - **Know** — an offline knowledge base of **1,209 technique playbooks and deep-dive writeups** covering Windows, Linux, web, cloud, Active Directory, evasion, and more — indexed locally, searched in milliseconds, ranked hits with exact paths. No network, no API, nothing leaves the machine.
 - **Strike** — the deterministic engine: **12 phases** from recon to report · **341 techniques / 1,819 executable ATT&CK tests** rendered and fired from the local rack (dry-run by default, `--go` executes) · a **461-entry phase-indexed weapon catalog** · a stdlib-first recon arsenal (DNS/AXFR/subdomain brute, port sweep with banners, TLS inspection, HTTP fingerprinting, sensitive-path probing, CORS and security-header checks).
-- **Ship** — the audit ledger, captured evidence, and `REPORT.md`: findings with severity, class, ATT&CK mapping, and exact next moves. Chains, not checklists.
+- **Ship** — the audit ledger, captured evidence, and `REPORT.md`: findings with severity, class, ATT&CK mapping, and exact next moves. Chains, not checklists. Platform submissions render per program — HackerOne (weakness/severity/steps/impact), Bugcrowd (VRT-mapped), Intigriti (impact-first) — and only findings that passed the 7-Question Gate get shipped.
 
-Everything is deterministic by default — the scope gate is enforced in code on every single action, and the engine runs fully offline. An optional LLM brain (any OpenAI-compatible endpoint) advises on attack planning; the code still gates everything it does.
+The operator layer never forgets: a cross-engagement memory ledger captures every confirmed finding, every tested technique that paid nothing, and every operator note — so `pickup` resumes a target exactly where the last run stopped, and `autopilot` drives the loop from that point to report with configurable checkpoints. Everything is deterministic by default — the scope gate is enforced in code on every single action, and the engine runs fully offline. An optional LLM brain (any OpenAI-compatible endpoint) advises on attack planning; the code still gates everything it does.
 
 ---
 
@@ -80,14 +80,31 @@ Then describe the objective in plain English and let it run:
 > Engage 10.0.0.0/24. Find the crown jewels and prove the full chain.
 
   ⟳ loading skills: shardreaper-recon, shardreaper-attack …
-    → recon: 14 live hosts · 63 open ports · 2 exposed .env files
+    → osint: +9 live in-scope subdomains · recon: 14 hosts · 63 ports · 2 exposed .env
     → plan: HIGH /.env disclosure @ 10.0.0.7  ← confirm-and-exploit
     → attack: T1083 File and Directory Discovery (dry-run)
+    → triage: F001 gate PASS · chain: .env -> credentials -> lateral
 
-  Next: escalate on 10.0.0.7, harvest credentials, move toward the DC?
+  Next: autopilot to report, or pickup after lunch — the ledger remembers.
 ```
 
 > The block above is an illustrative transcript.
+
+---
+
+## The operator layer
+
+Beyond the kill chain, ShardReaper carries the full operator toolkit:
+
+- **Memory + resume** — every confirmed finding is auto-captured to a cross-engagement ledger; `pickup <host>` resumes exactly where the last run stopped (sessions, findings, already-tested techniques, notes); `remember` adds operator context; `memory-gc` keeps the ledger lean.
+- **Autopilot** — `shardreaper autopilot <dir> --mode paranoid|normal|yolo` drives the engagement from wherever it stopped to report, with operator checkpoints; non-TTY stdin skips prompts; the scope gate stays on in every mode.
+- **Triage gate** — the 7-Question Gate (`triage`) kills N/A findings before report time; gate results are stored on the finding, shown in `surface`, and skipped by platform reports.
+- **Chain builder** — `chain --finding F001` turns a standalone finding into an A→B→C impact chain (IDOR→ATO, SSRF→cloud metadata, exposed .git→secrets→RCE, ...) with the playbook path for each step.
+- **Surface + intel + map** — `surface` ranks the discovered attack surface (P1/P2/kill list), `intel` maps the tech stack to attack playbooks, `map` routes any class to playbooks + atomics + weapons in one shot.
+- **OSINT** — passive scope expansion (certificate transparency + subfinder/assetfinder when installed), scope-filtered and liveness-probed, runs automatically before the active sweep.
+- **Platform reports** — `report --platform h1|bugcrowd|intigriti` emits program-shaped submissions; the default client report stays the red-team deliverable.
+- **Web3 audit** — `token-scan` catches the rug vectors (hidden mint, honeypot, fee manipulation, fake renounce, proxies, reentrancy, Solana authorities); the `shardreaper-web3` skill covers economics and access control.
+- **Burp integration** — set `SHARDREAPER_PROXY=http://127.0.0.1:8080` and every request flows through your intercepting proxy (CONNECT tunnel for HTTPS); a Burp MCP config template ships in `templates/`.
 
 ---
 
@@ -138,30 +155,37 @@ for the full posture.
 
 ## What's inside
 
-**9 skills**, loaded by phase:
+**12 skills**, loaded by phase:
 
 | Category | # | Skills |
 |---|---|---|
 | Doctrine | 1 | `shardreaper-core` |
 | Kill-chain phases | 8 | `shardreaper-recon` · `-attack` · `-persist` · `-privesc` · `-credharvest` · `-lateral` · `-evasion` · `-exfil-c2` |
+| Operator layer | 3 | `shardreaper-osint` · `shardreaper-report` · `shardreaper-web3` |
 
-**9 slash commands**: `engage`, `scope`, `recon`, `kb`, `plan`, `attack`,
-`escalate`, `harvest`, `exfil` — one per chain step.
+**23 slash commands**: `engage`, `scope`, `recon`, `kb`, `plan`, `attack`,
+`escalate`, `harvest`, `exfil`, `report`, `autopilot`, `pickup`, `remember`,
+`memory-gc`, `triage`, `chain`, `surface`, `intel`, `map`, `osint`,
+`token-scan`, `web3-audit`, `status` — one per operator move.
 
 **The engine** — deterministic, resumable, auditable:
 
 | Module | Role |
 |---|---|
-| `engine.py` | 12-phase orchestrator |
+| `engine.py` | 12-phase orchestrator + autopilot |
 | `scope.py` | deterministic scope gate (deny-wins, default-deny) |
 | `knowledge.py` | offline corpus router — 1,209 docs, ranked search |
 | `atomics.py` | 341 techniques / 1,819 executable ATT&CK tests |
 | `weapons.py` | 461-entry phase-indexed weapon catalog |
-| `recon.py` | stdlib-first recon arsenal + external tool wrappers |
+| `recon.py` | stdlib-first recon arsenal + proxy + external tool wrappers |
+| `osint.py` | passive scope expansion (CT logs, subfinder, assetfinder) |
+| `memory.py` | cross-engagement ledger — findings, negatives, rollups, resume |
+| `analysis.py` | triage gate, chain builder, surface ranking, intel, map |
+| `tokens.py` | web3 rug-pull audit |
 | `persona.py` | the operator doctrine, injected everywhere |
 | `llm.py` | optional OpenAI-compatible brain |
 | `state.py` | engagement ledger + resumable state |
-| `report.py` | operator deliverables |
+| `report.py` | client deliverable + H1/Bugcrowd/Intigriti submissions |
 
 ---
 
@@ -171,10 +195,10 @@ for the full posture.
 |---|---|
 | [`README.md`](README.md) | This file — overview, quickstart, how it works |
 | [`AGENTS.md`](AGENTS.md) | The doctrine — identity and law |
-| [`commands/`](commands/) | 9 slash commands |
-| [`skills/`](skills/) | 9 phase skills in SKILL.md format |
-| [`templates/`](templates/) | Engagement + report templates |
-| [`tests/`](tests/) | 24 self-tests, all green |
+| [`commands/`](commands/) | 22 slash commands |
+| [`skills/`](skills/) | 12 phase skills in SKILL.md format |
+| [`templates/`](templates/) | Engagement + report templates, Burp MCP config example |
+| [`tests/`](tests/) | 37 self-tests, all green |
 | [`SECURITY.md`](SECURITY.md) | Authorized-use posture |
 | [`LICENSE`](LICENSE) | MIT |
 
@@ -204,8 +228,12 @@ it. The reaper harvests what remains after.
 - [x] 12-phase engine · deterministic scope gate · offline knowledge base
 - [x] ATT&CK execution rack with dry-run/`--go` · weapon catalog
 - [x] Optional OpenAI-compatible LLM brain (persona + ROE always injected)
+- [x] Cross-engagement memory ledger · pickup/remember/autopilot
+- [x] Platform reports (H1 / Bugcrowd / Intigriti) · 7-Question triage gate
+- [x] Exploit-chain builder · surface ranking · intel · class-to-arsenal map
+- [x] Passive OSINT expansion · Burp proxy routing
+- [x] Web3 rug-pull audit (token-scan + audit skill)
 - [ ] Built-in HTTP exploitation primitives (auth-bypass checks, verb tampering)
-- [ ] Per-engagement memory layer — pattern recall across targets
 - [ ] C2 module (implant wrappers, DNS channel templates)
 - [ ] AD attack-path planning with graph collection
 - [ ] Report export to DOCX with embedded evidence

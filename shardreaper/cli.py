@@ -62,12 +62,20 @@ def main(argv=None):
     from . import engine, knowledge, atomics, weapons, scope as scopemod
     from . import report as reportmod
     from . import llm as llmmod
+    from . import memory as memorymod
+    from . import osint as osintmod
+    from . import tokens as tokensmod
+    from . import analysis as analysismod
 
     engine.build_arg_parser(sub)
     reportmod.build_arg_parser(sub)
     atomics.build_arg_parser(sub)
     weapons.build_arg_parser(sub)
     llmmod.build_arg_parser(sub)
+    memorymod.build_arg_parser(sub)
+    osintmod.build_arg_parser(sub)
+    tokensmod.build_arg_parser(sub)
+    analysismod.build_arg_parser(sub)
 
     kb = sub.add_parser("kb", help="search the local offensive corpus")
     kb.add_argument("query", nargs="+")

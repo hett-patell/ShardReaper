@@ -32,13 +32,13 @@ from .report import render_report
 PORT_TECH = {
     21: ["ftp", "anonymous"], 22: ["ssh", "brute"], 23: ["telnet"],
     25: ["smtp", "user-enum"], 53: ["dns", "zone-transfer"],
-    80: ["web", "dir-bruteforce"], 443: ["web", "tls"],
+    80: ["web server", "wordlist scan"], 443: ["web server", "tls"],
     445: ["smb", "enum", "eternalblue"], 139: ["smb", "netbios"],
     1433: ["mssql"], 1521: ["oracle"], 3306: ["mysql"],
     3389: ["rdp", "bluekeep"], 5432: ["postgres"], 5900: ["vnc"],
     5985: ["winrm"], 5986: ["winrm"], 6379: ["redis", "unauth"],
-    8080: ["web", "proxy"], 8443: ["web", "tls"], 8888: ["web"],
-    9000: ["web", "panel"], 9200: ["elasticsearch", "unauth"],
+    8080: ["web server", "proxy"], 8443: ["web server", "tls"], 8888: ["web server"],
+    9000: ["web server", "panel"], 9200: ["elasticsearch", "unauth"],
     11211: ["memcached"], 27017: ["mongodb", "unauth"],
     2375: ["docker", "unauth"], 2049: ["nfs", "no-root-squash"],
 }
@@ -69,7 +69,7 @@ TACTICAL_WEAPON_PHASES = {
 
 class Engine:
     def __init__(self, base, phases=None, go=False, mock=False, model=None,
-                 parallel=8, wordlist=None, top_ports=100, paths=True):
+                 parallel=8, wordlist=None, top_ports=100, paths=True, osint=True):
         self.base = base
         self.mock = mock
         self.go = go
@@ -77,10 +77,19 @@ class Engine:
         self.wordlist = wordlist
         self.top_ports = top_ports
         self.paths = paths
+        self.osint = osint
         self.eng = Engagement.load(base)
         self.scope = Scope.load(self.eng.scope_path)
         self.eng.log(f"engine start | scope={self.scope.name} phases={phases or 'default'} "
                      f"go={'EXECUTE' if go else 'DRY-RUN'} mock={mock}")
+        # cross-engagement memory: mark this session on every seed host
+        try:
+            from . import memory
+            for seed in self.scope.seeds:
+                h = seed.split("//")[-1].split("/")[0].split(":")[0]
+                memory.touch_session(h, self.eng.state.get("name", "engagement"))
+        except Exception:
+            pass
         self.kb = Knowledge()
         self.weapons = Weapons(self.kb.roots)
         atomic_root = self.kb.roots.get("atomic")
@@ -106,7 +115,7 @@ class Engine:
         targets = run_recon(self.scope, self.scope.seeds,
                             wordlist=self.wordlist,
                             top_ports=self.top_ports, paths=self.paths,
-                            log=self.eng.log)
+                            osint=self.osint, log=self.eng.log)
         self.eng.state["targets"] = targets
         self.eng.save()
         self.eng.log(f"recon: {len(targets)} target(s) — "
@@ -143,7 +152,7 @@ class Engine:
                     plan.append({"target": host, "action": "confirm-and-exploit",
                                  "detail": f_.get("path"), "severity": sev,
                                  "technique": "T1083 File and Directory Discovery",
-                                 "atomic": self._pick_atomic(["file", "directory", "discovery"])})
+                                 "atomic": self._pick_atomic(["file and directory", "discovery"])})
                 elif f_.get("type") == "dns-axfr":
                     plan.append({"target": host, "action": "dump-zone",
                                  "detail": "AXFR zone transfer", "severity": sev,
@@ -167,7 +176,7 @@ class Engine:
                                  "detail": f"web audit {u.get('url')} tech={u.get('tech')}",
                                  "severity": "info",
                                  "technique": "T1595.003 Wordlist Scanning",
-                                 "atomic": self._pick_atomic(["web", "directory", "scan"])})
+                                 "atomic": self._pick_atomic(["wordlist scan", "web server"])})
         # LLM refinement when the brain is available
         if LLM.available() and not self.mock:
             self._llm_refine_plan(plan)
@@ -243,6 +252,13 @@ class Engine:
                     else:
                         self.eng.log(f"  [{at['technique']}] rc={r.get('returncode')} "
                                      f"{r.get('stdout', r.get('error', ''))[:100]}", "action")
+                    # negative memory: tried without a confirmed finding — never re-waste it
+                    if r.get("dry_run") or not r.get("ok"):
+                        try:
+                            from . import memory
+                            memory.log_negative(target, at["technique"], at["name"])
+                        except Exception:
+                            pass
             else:
                 self.eng.log_action(technique=item.get("technique", "?"),
                                     target=target, detail=item["detail"],
@@ -348,8 +364,43 @@ def cli_run(args):
         return 2
     eng = Engine(base, phases=phases, go=args.go, mock=args.mock,
                  wordlist=args.wordlist, top_ports=args.top_ports,
-                 paths=not args.no_paths)
+                 paths=not args.no_paths, osint=not args.no_osint)
     eng.run()
+    return 0
+
+
+def cli_autopilot(args):
+    """Autonomous loop: resume where the engagement left off and drive to report.
+
+    Checkpoints: --paranoid after every phase (default) · --normal after attack
+    · --yolo none. Non-TTY stdin skips prompts so pipelines stay safe. The
+    scope gate stays on for every phase regardless of mode.
+    """
+    import sys as _sys
+    base = os.path.abspath(args.dir)
+    if not os.path.isfile(os.path.join(base, "state.json")):
+        print(f"no engagement at {base} — run: shardreaper engage ...")
+        return 1
+    eng = Engagement.load(base)
+    cur = eng.phase if eng.phase in PHASES else "engage"
+    remaining = PHASES[PHASES.index(cur):]
+    if args.phases:
+        remaining = [p.strip() for p in args.phases.split(",") if p.strip()]
+    interactive = _sys.stdin.isatty() and not args.yes
+    checkpoint = {"paranoid": "all", "normal": "attack", "yolo": "none"}[args.mode]
+    print(f"autopilot [{args.mode}] — phases: {', '.join(remaining)}")
+    for phase in remaining:
+        e = Engine(base, phases=[phase], go=args.go, mock=args.mock)
+        e.run()
+        if interactive and (checkpoint == "all" or
+                            (checkpoint == "attack" and phase in ("attack", "report"))):
+            try:
+                a = input(f"[autopilot] continue after {phase}? [Enter=yes / q=stop] ")
+            except (EOFError, KeyboardInterrupt):
+                a = "q"
+            if a.strip().lower() == "q":
+                print("autopilot stopped by operator")
+                return 0
     return 0
 
 
@@ -393,7 +444,18 @@ def build_arg_parser(sub):
     rp.add_argument("--wordlist", default=None, help="subdomain wordlist (default: builtin)")
     rp.add_argument("--top-ports", type=int, default=100)
     rp.add_argument("--no-paths", action="store_true", help="skip sensitive-path probing")
+    rp.add_argument("--no-osint", action="store_true", help="skip passive scope expansion")
     rp.set_defaults(fn=cli_run)
+
+    ap = sub.add_parser("autopilot", help="autonomous loop to report, with checkpoints")
+    ap.add_argument("dir", help="engagement folder")
+    ap.add_argument("--phases", default="", help="override phases (default: resume from state)")
+    ap.add_argument("--mode", default="paranoid", choices=["paranoid", "normal", "yolo"],
+                    help="checkpoint density")
+    ap.add_argument("--go", action="store_true")
+    ap.add_argument("--mock", action="store_true")
+    ap.add_argument("--yes", action="store_true", help="skip prompts (non-interactive)")
+    ap.set_defaults(fn=cli_autopilot)
 
     sp = sub.add_parser("status", help="engagement status")
     sp.add_argument("dir")
