@@ -26,6 +26,13 @@ from urllib.parse import urlparse
 
 def _host_of(target):
     t = target.strip()
+    # bare IPv6 (with or without brackets): parse directly, not as host:port
+    if t.count(":") > 1 and "://" not in t:
+        try:
+            ipaddress.IPv6Address(t.strip("[]"))
+            return t.strip("[]").lower()
+        except ValueError:
+            pass
     if "://" not in t:
         t = "//" + t
     host = (urlparse(t).hostname or "").lower().rstrip(".")
@@ -60,32 +67,35 @@ class _Rule:
         self.port = None
         self.path = None
         body = pattern.strip().lower()
-        # strip a trailing path binding
-        m = re.search(r"(.*?)(/.*)$", body)
-        if m and "/" in m.group(1) and not m.group(1).startswith("re:"):
-            # only treat as path if the first part has no slash already (CIDR has one)
-            if "/" not in m.group(1).replace("re:", ""):
-                pass
-        # port binding: host:PORT or host:P1-P2
+        self.regex = None
+        self.cidr = None
+        self.hostpat = body
+        if body.startswith("re:"):
+            try:
+                self.regex = re.compile(body[3:])
+            except re.error:
+                self.regex = None
+            return
+        # CIDR (IPv4/IPv6): 10.0.0.0/8, 2001:db8::/32
+        if re.match(r"^[0-9a-f:.]+/\d+$", body):
+            try:
+                self.cidr = ipaddress.ip_network(body, strict=False)
+            except ValueError:
+                self.cidr = None
+            return
+        # path binding: host/path (e.g. example.com/api)
+        if "/" in body and not body.startswith("re:"):
+            host, _, path = body.partition("/")
+            self.hostpat = host
+            self.path = "/" + path
+            return
+        # port binding: host:PORT or host:P1-P2 — but NOT bare IPv6 (2001:db8::1)
         m = re.match(r"^(.*?):(\d+)(?:-(\d+))?$", body)
-        if m and not body.startswith("re:") and not re.match(r"^[0-9a-f:]+/\d+$", body):
+        if m and body.count(":") == 1:
             self.hostpat = m.group(1)
             self.port = (int(m.group(2)), int(m.group(3)) if m.group(3) else int(m.group(2)))
         else:
             self.hostpat = body
-        if self.hostpat.startswith("re:"):
-            try:
-                self.regex = re.compile(self.hostpat[3:])
-            except re.error:
-                self.regex = None
-        else:
-            self.regex = None
-            self.cidr = None
-            if "/" in self.hostpat and self.hostpat.replace(".", "").replace("/", "").isdigit():
-                try:
-                    self.cidr = ipaddress.ip_network(self.hostpat, strict=False)
-                except ValueError:
-                    self.cidr = None
 
     def matches_host(self, host):
         if self.regex is not None:
@@ -188,10 +198,14 @@ class OutOfScopeError(Exception):
         self.reason = reason
 
 
-def check(targets, scope_path=None, in_scope=None, out_of_scope=None, verbose=False):
+def check(targets, scope_path=None, in_scope=None, out_of_scope=None):
     """CLI entry: deterministic gate. Exits non-zero on any out-of-scope hit."""
     if scope_path:
-        s = Scope.load(scope_path)
+        try:
+            s = Scope.load(scope_path)
+        except (OSError, ValueError) as e:
+            print(f"error loading scope {scope_path}: {e}")
+            return 1
     else:
         s = Scope(in_scope, out_of_scope, name="cli")
     ok = True

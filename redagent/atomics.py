@@ -13,7 +13,6 @@ defaults, supported_platforms, and dependency checks.
 """
 import os
 import re
-import shlex
 import subprocess
 
 try:
@@ -54,7 +53,8 @@ def _mini_yaml(text):
         m = re.search(r"description:\s*\|-?\n((?:[ \t]+.*\n?)+)", b)
         if m:
             test["description"] = "\n".join(l.strip() for l in m.group(1).splitlines())[:400]
-        test["supported_platforms"] = re.findall(r"^-\s+(\S+)", b, re.M)
+        test["supported_platforms"] = [
+            m2 for m2 in re.findall(r"^  -\s+(\S+)$", b, re.M) if ":" not in m2]
         m = re.search(r"executor:\s*\n\s*name:\s*(\S+)", b)
         if m:
             test["executor"]["name"] = m.group(1)
@@ -145,8 +145,13 @@ class AtomicIndex:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return [{"id": t, "name": n, "score": s} for s, t, n in scored[:limit]]
 
-    def select(self, keywords=None, platform=None, limit=12):
-        """Pick the most relevant tests for a phase/keyword + host platform."""
+    def select(self, keywords=None, platform=None, limit=12, strict=False):
+        """Pick the most relevant tests for a phase/keyword + host platform.
+
+        strict=True counts only test-name and technique-name matches (no
+        description hits) — used by the engine so generic words like "web"
+        cannot drag in loosely-related tests.
+        """
         kw = [k.lower() for k in (keywords or [])]
         picked = []
         for tid, tech in self._load().items():
@@ -162,10 +167,10 @@ class AtomicIndex:
                 for k in kw:
                     if k in name:
                         s += 3
-                    elif k in desc:
-                        s += 1
                     elif k in tech["display_name"].lower():
                         s += 2
+                    elif not strict and k in desc:
+                        s += 1
                 if s:
                     picked.append((s, tid, t))
         picked.sort(key=lambda x: (-x[0], x[1]))

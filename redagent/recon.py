@@ -17,7 +17,6 @@ import shutil
 import socket
 import ssl
 import subprocess
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
@@ -61,8 +60,6 @@ TECH_PATTERNS = [
 ]
 MISSING_HEADERS = ["strict-transport-security", "content-security-policy",
                    "x-frame-options", "x-content-type-options", "x-xss-protection"]
-
-_conn_lock = threading.Lock()
 
 
 class Recon:
@@ -311,7 +308,10 @@ class Recon:
             return {"url": url, "error": str(e)}
 
     def security_header_audit(self, url):
-        r = self._http(url)
+        try:
+            r = self._http(url)
+        except (OSError, OutOfScopeError) as e:
+            return {"url": url, "error": str(e)}
         missing = [h for h in MISSING_HEADERS if h not in r["headers"]]
         return {"url": url, "status": r["status"], "missing": missing}
 
@@ -402,6 +402,21 @@ def run_recon(scope, seeds, wordlist=None, ports=None, top_ports=100, workers=32
                 if cert.get("expired"):
                     target["findings"].append({"type": "tls", "severity": "medium",
                                                "detail": f"expired TLS cert @ {host}:{p}"})
+            # CORS misconfiguration check
+            cors = r.cors_check(url)
+            if cors.get("vulnerable"):
+                target["findings"].append({"type": "cors", "severity": "medium",
+                                           "detail": f"CORS reflects arbitrary Origin "
+                                                     f"(ACAO={cors.get('acao')}, "
+                                                     f"credentials={cors.get('credentials')})"})
+                log(f"  {url}: CORS misconfiguration", "win")
+            # missing security headers audit
+            audit = r.security_header_audit(url)
+            if audit.get("missing"):
+                target["findings"].append({"type": "missing-headers",
+                                           "severity": "low",
+                                           "detail": f"missing security headers: "
+                                                     f"{', '.join(audit['missing'])}"})
             if paths:
                 found = r.check_paths(url)
                 for f_ in found:
@@ -420,6 +435,12 @@ def run_recon(scope, seeds, wordlist=None, ports=None, top_ports=100, workers=32
                                                    "path": f_["path"], "status": 200})
                 if found:
                     log(f"  {url}: {len(found)} interesting paths", "action")
+        # external tool enrichment (nmap service detection) when installed
+        if include_external:
+            nm = r.nmap(host)
+            if nm and nm.get("services"):
+                target["intel"]["nmap"] = nm["services"]
+                log(f"  {host}: nmap identified {len(nm['services'])} services", "action")
         if open_ports:
             log(f"  {host}: {len(open_ports)} open ports: "
                 f"{','.join(str(p) for p in list(open_ports)[:20])}", "action")

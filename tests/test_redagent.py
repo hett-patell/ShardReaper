@@ -18,7 +18,7 @@ from redagent.llm import extract_json
 # ---------------- scope ----------------
 def test_scope_patterns():
     s = Scope(["example.com", "*.sub.example.com", "api.exact.io",
-               "10.0.0.0/8", "re:^lab[0-9]+\\.example\\.com$", "svc.example.com:8443"],
+               "10.0.0.0/8", r"re:^lab[0-9]+\.example\.com$", "svc.example.com:8443"],
               out_of_scope=["admin.example.com", "10.0.0.5"])
     assert s.in_scope_host("example.com")
     assert s.in_scope_host("api.example.com")          # apex rule covers subdomains
@@ -47,7 +47,7 @@ def test_scope_wildcard_excludes_apex():
 
 
 def test_scope_regex_alone():
-    s = Scope(["re:^lab[0-9]+\\.example\\.com$"])
+    s = Scope([r"re:^lab[0-9]+\.example\.com$"])
     assert s.in_scope_host("lab42.example.com")
     assert not s.in_scope_host("lab.example.com")
     assert not s.in_scope_host("lab42.example.com.evil.net")
@@ -59,6 +59,31 @@ def test_scope_port_binding_alone():
     assert not s.in_scope("svc.example.com", port=80)
     assert s.in_scope("web.example.com", port=8500)
     assert not s.in_scope("web.example.com", port=7999)
+
+
+def test_scope_path_binding():
+    s = Scope(["example.com/api"])
+    assert s.in_scope("example.com", port=443, path="/api")
+    assert s.in_scope("example.com", port=443, path="/api/v1/users")
+    assert not s.in_scope("example.com", port=443, path="/admin")
+    assert not s.in_scope("example.com", port=443, path="/")     # base path denied
+    # path rule is port-blind
+    assert s.in_scope("example.com", port=8080, path="/api")
+
+
+def test_scope_bare_ipv6():
+    s = Scope(["2001:db8::1"])
+    assert s.in_scope_host("2001:db8::1")
+    assert not s.in_scope_host("2001:db8::2")
+    s6 = Scope(["2001:db8::/32"])
+    assert s6.in_scope_host("2001:db8::42")
+    assert not s6.in_scope_host("2001:db9::1")
+
+
+def test_scope_check_missing_file():
+    from redagent.scope import check
+    rc = check(["example.com"], scope_path="/nonexistent/scope.json")
+    assert rc == 1
 
 
 def test_scope_wildcard_excludes_apex():
@@ -161,6 +186,27 @@ def test_mini_yaml():
     assert t["input_arguments"]["exe_path"]["default"] == "C:\\Tools\\mimikatz.exe"
 
 
+def test_mini_yaml_platforms():
+    src = """attack_technique: T1010
+display_name: 'Application Window Discovery'
+atomic_tests:
+- name: Test one
+  description: x
+  supported_platforms:
+  - windows
+  - macos
+  executor:
+    command: |
+      whoami
+    name: sh
+  dependencies:
+  - description: prereq
+    prereq_command: exit 0
+"""
+    d = _mini_yaml(src)
+    assert d["atomic_tests"][0]["supported_platforms"] == ["windows", "macos"]
+
+
 def test_atomic_index_real():
     roots = corpus_roots()
     if "atomic" not in roots:
@@ -177,6 +223,67 @@ def test_atomic_index_real():
     assert r["dry_run"] and r["cmd"]
 
 
+def test_atomic_strict_select():
+    roots = corpus_roots()
+    if "atomic" not in roots:
+        return
+    idx = AtomicIndex(roots["atomic"])
+    loose = idx.select(["web"], platform=None, limit=10, strict=False)
+    strict = idx.select(["web"], platform=None, limit=10, strict=True)
+    assert strict
+    # every strict hit must match the keyword in the test NAME or technique name
+    for s in strict:
+        hay = (s["name"] + " " + s["technique_name"]).lower()
+        assert "web" in hay
+    # strict mode may be smaller but never empty
+    assert all(s["score"] >= 2 for s in strict)
+
+
+def test_tactical_weapon_mapping():
+    from redagent.engine import TACTICAL_WEAPON_PHASES
+    from redagent.weapons import Weapons
+    w = Weapons(corpus_roots(), refresh=False)
+    assert TACTICAL_WEAPON_PHASES["escalate"] == "privilege-escalation"
+    assert TACTICAL_WEAPON_PHASES["exfil"] == ["exfiltration", "c2"]
+    for key, wps in TACTICAL_WEAPON_PHASES.items():
+        wps = wps if isinstance(wps, list) else [wps]
+        got = []
+        for wp in wps:
+            got += w.by_phase(wp, limit=8)
+        assert got, f"tactical phase {key} must resolve to weapons"
+
+
+def test_phase_validation():
+    from redagent.engine import cli_run
+    import tempfile, os
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory() as d:
+        base = os.path.join(d, "eng")
+        engage_local(base)
+        ok = cli_run(SimpleNamespace(dir=base, phases="recon,bogus", go=False,
+                                     mock=True, wordlist=None, top_ports=100,
+                                     no_paths=False))
+        assert ok == 2
+
+
+def engage_local(base):
+    from redagent.engine import engage
+    engage(base, "t", ["http://localhost:8000"], ["localhost"], [], "obj", mock=True)
+
+
+def test_engage_seed_scope_warning(tmp_path=None):
+    import io, contextlib
+    from redagent.engine import engage
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            engage(os.path.join(d, "eng"), "warn-demo", ["http://evil.net"],
+                   ["localhost"], [], "")
+        out = buf.getvalue()
+        assert "OUT of scope" in out
+
+
 # ---------------- llm ----------------
 def test_extract_json():
     assert extract_json('x ```json\n{"a": 1}\n``` y') == {"a": 1}
@@ -191,13 +298,45 @@ def test_engine_mock_pipeline():
         base = os.path.join(d, "eng")
         engage(base, "mock-lab", ["http://localhost:8000"], ["localhost"],
                ["admin.localhost"], "prove local lab access", mock=True)
-        eng = Engine(base, phases=["recon", "analyze", "plan", "report"], mock=True)
+        eng = Engine(base, phases=["recon", "analyze", "plan", "attack", "report"], mock=True)
         eng.run()
         assert eng.eng.state["targets"]
         assert eng.eng.state["plan"]
         report = os.path.join(base, "REPORT.md")
         assert os.path.isfile(report)
         assert "RedAgent Engagement Report" in open(report).read()
+
+
+def test_engine_tactical_phases():
+    from redagent.engine import engage, Engine
+    with tempfile.TemporaryDirectory() as d:
+        base = os.path.join(d, "eng")
+        engage(base, "tactical-lab", ["http://localhost:8000"], ["localhost"],
+               [], "obj", mock=True)
+        eng = Engine(base, phases=["escalate", "persist", "move", "harvest",
+                                   "evade", "exfil", "report"], mock=True)
+        eng.run()
+        notes = eng.eng.state["notes"]
+        tactical = [n for n in notes if str(n.get("kind", "")).startswith("tactical-")]
+        assert len(tactical) == 6
+        for n in tactical:
+            assert n.get("weapons"), f"{n['kind']} must record weapons"
+        assert os.path.isfile(os.path.join(base, "REPORT.md"))
+
+
+def test_report_renders_findings():
+    from redagent.report import render_report
+    with tempfile.TemporaryDirectory() as d:
+        eng = Engagement(d, "t1")
+        eng.add_finding("Exposed .env with secrets", "high", "info-leak",
+                        "T1552", "target.local", ["GET /.env -> 200"],
+                        "AWS keys visible", "credential theft", "remove file")
+        eng.add_finding("Missing security headers", "low", "hardening",
+                        "T1595", "target.local", [], "no CSP/HSTS")
+        eng.log_action("T1552", "target.local", "GET /.env", outcome="executed")
+        md = render_report(eng)
+        assert "F001" in md and "HIGH" in md and "F002" in md and "LOW" in md
+        assert "attack.mitre.org" in md
 
 
 if __name__ == "__main__":

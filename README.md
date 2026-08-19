@@ -42,6 +42,8 @@ python3 bin/redagent engage eng/ --name mylab \
 
 # 2. Run the phases (dry-run by default — atomic tests are rendered, not fired):
 python3 bin/redagent run eng/ --phases recon,analyze,plan,attack,report
+python3 bin/redagent run eng/ --phases recon --top-ports 1000 --wordlist my-subs.txt
+python3 bin/redagent run eng/ --phases attack --no-paths   # skip path probing
 
 # 3. Execute with --go when the operator says so, then report:
 python3 bin/redagent run eng/ --phases attack --go
@@ -114,8 +116,9 @@ to turn it into RedAgent. `AGENTS.md` is the full doctrine.
 ## Scope patterns
 
 `example.com` (apex + subdomains) · `*.example.com` (subdomains only) ·
-`api.example.com` (exact) · `10.0.0.0/8` (CIDR) · `re:^lab[0-9]+\.example\.com$`
-(regex) · `host:8443` (port-bound) · deny wins · default deny.
+`api.example.com` (exact) · `10.0.0.0/8` (IPv4 CIDR) · `2001:db8::/32`
+(IPv6 CIDR) · `re:^lab[0-9]+\.example\.com$` (regex) · `host:8443`
+(port-bound) · `host/api` (path-bound) · deny wins · default deny.
 
 ## Layout
 
@@ -139,7 +142,7 @@ red-agent/
 ├── commands/            # slash commands
 ├── templates/           # engagement/report templates
 ├── data/                # wordlists + parsed catalog cache
-└── tests/               # self-tests (14, all green)
+└── tests/               # self-tests (24, all green)
 ```
 
 ## Legal note

@@ -265,8 +265,6 @@ class Knowledge:
 
 def cli_search(query, limit=8, corpus=None):
     k = Knowledge()
-    print(k.summary())
-    print()
     results = k.search(query, limit=limit, corpora=[corpus] if corpus else None)
     if not results:
         print(f"no hits for: {query}")

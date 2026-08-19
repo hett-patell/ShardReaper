@@ -15,10 +15,8 @@ Usage:
     redagent run --phases attack --go           # execute (not just dry-run)
     redagent run --phases report
 """
-import argparse
 import json
 import os
-import sys
 
 from .scope import Scope
 from .state import Engagement, PHASES
@@ -58,14 +56,27 @@ PHASE_TECH_KEYWORDS = {
     "exfil": ["exfiltration", "dns exfil", "sftp", "stealth"],
 }
 
+# tactical phase -> weapons-catalog phase (catalogs use ATT&CK-ish names)
+TACTICAL_WEAPON_PHASES = {
+    "escalate": "privilege-escalation",
+    "persist": "persistence",
+    "move": "lateral-movement",
+    "harvest": "credential-access",
+    "evade": "defense-evasion",
+    "exfil": ["exfiltration", "c2"],
+}
+
 
 class Engine:
     def __init__(self, base, phases=None, go=False, mock=False, model=None,
-                 parallel=8):
+                 parallel=8, wordlist=None, top_ports=100, paths=True):
         self.base = base
         self.mock = mock
         self.go = go
         self.parallel = parallel
+        self.wordlist = wordlist
+        self.top_ports = top_ports
+        self.paths = paths
         self.eng = Engagement.load(base)
         self.scope = Scope.load(self.eng.scope_path)
         self.eng.log(f"engine start | scope={self.scope.name} phases={phases or 'default'} "
@@ -81,9 +92,6 @@ class Engine:
         hits = self.kb.search(query, limit=limit)
         return [f"[{h['corpus']}] {h['title']} — {h['rel']}" for h in hits]
 
-    def kb_lines(self, query, limit=4):
-        return "\n".join(self.kb_hits(query, limit))
-
     # ---------------- phases ----------------
     def phase_recon(self):
         self.eng.set_phase("recon")
@@ -96,10 +104,9 @@ class Engine:
             self.eng.log(f"recon(mock): {len(self.eng.state['targets'])} target(s)")
             return
         targets = run_recon(self.scope, self.scope.seeds,
-                            wordlist=os.path.join(os.path.dirname(self.base), "..", "data",
-                                                  "wordlists", "subdomains.txt")
-                            if False else None,
-                            top_ports=100, log=self.eng.log)
+                            wordlist=self.wordlist,
+                            top_ports=self.top_ports, paths=self.paths,
+                            log=self.eng.log)
         self.eng.state["targets"] = targets
         self.eng.save()
         self.eng.log(f"recon: {len(targets)} target(s) — "
@@ -171,12 +178,10 @@ class Engine:
     def _pick_atomic(self, keywords):
         if not self.atomics:
             return None
-        sel = self.atomics.select(keywords, platform=self._host_platform(), limit=3)
+        # no platform filter: the target OS is unknown at plan time and dry-run
+        # rendering is safe on any runner (powershell exec is blocked on linux)
+        sel = self.atomics.select(keywords, platform=None, limit=3, strict=True)
         return [{"technique": s["technique"], "name": s["name"]} for s in sel]
-
-    @staticmethod
-    def _host_platform():
-        return "linux" if os.name == "posix" else "windows"
 
     def _plan_severity_counts(self, plan):
         from collections import Counter
@@ -249,14 +254,19 @@ class Engine:
         self.eng.set_phase(phase)
         kw = PHASE_TECH_KEYWORDS[key]
         self.eng.log(f"{phase}: selecting techniques from corpus…", "action")
-        kb = self.kb_lines(" ".join(kw[:3]), limit=6)
+        kb = self.kb_hits(" ".join(kw[:3]), limit=6)
         for line in kb:
             self.eng.log(f"  KB  {line}", "action")
         if self.atomics:
-            sel = self.atomics.select(kw, platform=self._host_platform(), limit=6)
+            sel = self.atomics.select(kw, platform=None, limit=6, strict=True)
             for s in sel:
                 self.eng.log(f"  AT  [{s['technique']}] {s['name']}", "action")
-        weapons = self.weapons.by_phase(phase, limit=8)
+        wphases = TACTICAL_WEAPON_PHASES.get(key, phase)
+        if not isinstance(wphases, list):
+            wphases = [wphases]
+        weapons = []
+        for wp in wphases:
+            weapons += self.weapons.by_phase(wp, limit=8)
         for w in weapons[:6]:
             self.eng.log(f"  WPN {w['name']} — {w['url']}", "action")
         self.eng.state["notes"].append({"ts": self.eng.state["updated"],
@@ -299,6 +309,7 @@ def engage(base, name, seeds, in_scope, out_of_scope, objective="", mock=False):
     with open(scope_path, "w", encoding="utf-8") as f:
         json.dump({"name": name, "in_scope": in_scope or [],
                    "out_of_scope": out_of_scope or [], "seeds": seeds or []}, f, indent=2)
+    scope = Scope(in_scope, out_of_scope, seeds, name)
     eng = Engagement(base, name, scope_path)
     eng.state["seeds"] = seeds or []
     if objective:
@@ -306,8 +317,16 @@ def engage(base, name, seeds, in_scope, out_of_scope, objective="", mock=False):
     eng.save()
     eng.log(f"engagement created: {base} (scope: {len(in_scope or [])} in / "
             f"{len(out_of_scope or [])} out / {len(seeds or [])} seeds)")
+    # loud pre-flight warnings — the operator owns the scope, the agent obeys it
+    if not in_scope:
+        eng.log("WARNING: no in-scope rules — everything is DENIED (default deny)", "warn")
+    if not seeds:
+        eng.log("WARNING: no seeds — recon has nothing to start from", "warn")
+    for seed in seeds or []:
+        if not scope.in_scope_host(seed):
+            eng.log(f"WARNING: seed {seed} is OUT of scope — recon will skip it", "warn")
     print()
-    print(Scope.load(scope_path).describe())
+    print(scope.describe())
     return base
 
 
@@ -323,7 +342,13 @@ def cli_run(args):
         return 1
     phases = [p.strip() for p in args.phases.split(",") if p.strip()] if args.phases \
         else ["recon", "analyze", "plan", "report"]
-    eng = Engine(base, phases=phases, go=args.go, mock=args.mock)
+    bad = [p for p in phases if p not in PHASES]
+    if bad:
+        print(f"unknown phase(s): {', '.join(bad)} — valid: {', '.join(PHASES)}")
+        return 2
+    eng = Engine(base, phases=phases, go=args.go, mock=args.mock,
+                 wordlist=args.wordlist, top_ports=args.top_ports,
+                 paths=not args.no_paths)
     eng.run()
     return 0
 
@@ -365,6 +390,9 @@ def build_arg_parser(sub):
                     "escalate,persist,move,harvest,evade,exfil,report")
     rp.add_argument("--go", action="store_true", help="EXECUTE atomic tests (default dry-run)")
     rp.add_argument("--mock", action="store_true")
+    rp.add_argument("--wordlist", default=None, help="subdomain wordlist (default: builtin)")
+    rp.add_argument("--top-ports", type=int, default=100)
+    rp.add_argument("--no-paths", action="store_true", help="skip sensitive-path probing")
     rp.set_defaults(fn=cli_run)
 
     sp = sub.add_parser("status", help="engagement status")

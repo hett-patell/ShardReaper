@@ -96,19 +96,23 @@ def decide(task, system=None, context=None, want_json=True, max_tokens=1200):
 
 
 def cli_ask(args):
+    cli_ask_question(" ".join(args.task), args.scope, args.objective, args.max_tokens)
+
+
+def cli_ask_question(task, scope, objective, max_tokens):
     if not available():
         print("no brain configured: set REDAGENT_LLM_BASE/REDAGENT_LLM_KEY/"
               "REDAGENT_LLM_MODEL (OpenAI-compatible). Deterministic mode active.")
         return
     from .persona import build_operator_prompt
-    sys = build_operator_prompt(args.scope or "", args.objective or "", llm_tools=False)
-    text, js = decide(args.task, system=sys, want_json=False, max_tokens=args.max_tokens)
+    sys = build_operator_prompt(scope or "", objective or "", llm_tools=False)
+    text, js = decide(task, system=sys, want_json=False, max_tokens=max_tokens)
     print(text or "(empty reply)")
 
 
 def build_arg_parser(sub):
     p = sub.add_parser("ask", help="ask the LLM brain a question (needs REDAGENT_LLM_*)")
-    p.add_argument("task")
+    p.add_argument("task", nargs="+", help="question for the brain")
     p.add_argument("--scope", default="")
     p.add_argument("--objective", default="")
     p.add_argument("--max-tokens", type=int, default=1200)
