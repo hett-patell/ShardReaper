@@ -3,7 +3,7 @@
 
 # ShardReaper
 
-> A self-contained, autonomous red team operator · **13-phase kill chain** · **1,819 executable ATT&CK tests** · **2,700+ technique playbooks & payload scripts** in an offline knowledge base · **700+ weapon & resource catalog** · deterministic scope gate · cross-engagement memory with resume · platform reports (HackerOne / Bugcrowd / Intigriti) · 7-Question triage gate + full validation · exploit-chain builder · passive OSINT · web3 rug-pull audit · ATT&CK Navigator export · SQLi oracle + encoded exfil · file fuzzing · pure-python crackers · arsenal self-check · canary listener · transport healthcheck · token spray with authn/authz differential · kubelet WebSocket exec + canned pod→mount→SSH chain · adaptive scan pacing · optional LLM brain · zero runtime dependencies. One shard. Sharpest edge. Total harvest.
+> A self-contained, autonomous red team operator · **13-phase kill chain** · **1,819 executable ATT&CK tests** · **2,700+ technique playbooks & payload scripts** in an offline knowledge base · **700+ weapon & resource catalog** · deterministic scope gate · origin-bound HTTP transport (per-origin cookie jars) · cross-engagement memory with resume · platform reports (HackerOne / Bugcrowd / Intigriti) · 7-Question triage gate + full validation · exploit-chain builder · passive OSINT · web3 rug-pull audit · ATT&CK Navigator export · SQLi oracle + encoded exfil · file fuzzing · pure-python crackers · arsenal self-check · canary listener · transport healthcheck · token spray with authn/authz differential + stateful web logins · kubelet WebSocket exec + canned pod→mount→SSH chain · sink contracts before payloads · hypothesis budgets + tombstones · fingerprint→advisory mapping · gitmine secret hunting · priv dataflow audit · transport watchdog · adaptive scan pacing · optional LLM brain · zero runtime dependencies. One shard. Sharpest edge. Total harvest.
 
 ---
 
@@ -99,7 +99,7 @@ Beyond the kill chain, ShardReaper carries the full operator toolkit:
 ## Field lessons — hardened on HTB Cobblestone
 
 ShardReaper failed its first real machine, took the writeup, and turned every
-failure into code. The fifteen lessons are now LAW (see `AGENTS.md` §8):
+failure into code. All twenty-three lessons are now LAW (see `AGENTS.md` §8):
 
 | # | Lesson | Enforced by |
 |---|---|---|
@@ -118,6 +118,14 @@ failure into code. The fifteen lessons are now LAW (see `AGENTS.md` §8):
 | 13 | Exec contract: side-effect probe first, then source | `kube probe` — marker round-trip before entrypoints; /proc/mountinfo, cgroup, SA token over black-box guessing |
 | 14 | Literal payloads; verify flags after silent state changes | `payload` — no cross-boundary shell expansion, BEGIN/END markers, /proc/mounts rw-flag verify, NSpid/userns proof |
 | 15 | pkill must never kill the caller; fixed = tested | `safe_kill` brackets patterns, raw `pkill -f` banned at execution; `rack-check` AST check + live recon smoke test |
+| 16 | A target is an origin, not an IP:port | `http.OriginTransport` — per-origin cookie jars, `--resolve` semantics, anon/auth jars never shared; recon emits origins |
+| 17 | Every auth surface type is sprayable; the list is extensible | `spray` surface registry — stateful web logins (CSRF + redirect classification), git hosts, basic-auth APIs, redis/mysql/postgres, IMAP |
+| 18 | Sink contract before payload | `sink` gate — source read or `{{7*7}}`-style marker must answer before exploit construction; analyze records unverified contracts |
+| 19 | Hypotheses have kill-criteria, not enthusiasm | `hypothesis` lifecycle — probe budget + no-evidence cutoff, tombstones with the reason, dead theories never resurrected |
+| 20 | Known-software CVEs are recon data | `advisory_map` (NVD/GHSA/searchsploit) auto-runs in analyze — vendor/vuln sources only, never box writeups |
+| 21 | Git hosts are secret mines | `gitmine` — users/orgs/repos enum, commit diffs, deleted-secret hunting always via blob hashes |
+| 22 | Privileged consumers of attacker input are the Linux root path | `priv` — timer/cron inventory, input-source tracing, path-escape canaries |
+| 23 | Infrastructure churn is assumed | `watchdog` — auto-reconnect + target re-validation; per-phase checkpoints make a redeploy replay, not recon |
 
 ---
 
@@ -176,12 +184,12 @@ for the full posture.
 | Kill-chain phases | 8 | `shardreaper-recon` · `-attack` · `-persist` · `-privesc` · `-credharvest` · `-lateral` · `-evasion` · `-exfil-c2` |
 | Operator layer | 3 | `shardreaper-osint` · `shardreaper-report` · `shardreaper-web3` |
 
-**35 slash commands**: `engage`, `hunt`, `scope`, `recon`, `kb`, `classify`,
+**40 slash commands**: `engage`, `hunt`, `scope`, `recon`, `kb`, `classify`,
 `plan`, `attack`, `escalate`, `harvest`, `exfil`, `report`, `autopilot`,
 `pickup`, `remember`, `memory-gc`, `triage`, `validate`, `chain`, `surface`,
 `intel`, `map`, `osint`, `token-scan`, `web3-audit`, `status`, `sqli`, `fuzz`,
-`crack`, `arsenal`, `canary`, `healthcheck`, `spray`, `kube`, `rack-check` —
-one per operator move.
+`crack`, `arsenal`, `canary`, `healthcheck`, `spray`, `kube`, `rack-check`,
+`sink`, `hypotheses`, `gitmine`, `priv`, `watchdog` — one per operator move.
 
 **The engine** — deterministic, resumable, auditable:
 
@@ -205,6 +213,11 @@ one per operator move.
 | `spray.py` | token spray + authn/authz differential classifier (400/401/403/404/500) |
 | `payload.py` | literal payload discipline, markers + verify flags, NSpid/userns proof, `safe_kill` |
 | `rackcheck.py` | rack regression gate: AST structural check + pkill audit |
+| `http.py` | origin-bound transport — per-origin cookie jars, `--resolve` semantics, anon/auth isolation |
+| `sink.py` | sink-contract gate: source read or marker self-test before any payload |
+| `hypothesis.py` | theory lifecycle — budgets, no-evidence cutoffs, tombstones |
+| `gitmine.py` | git-host mine — enumeration + blob-hash secret hunting |
+| `priv.py` | privileged-consumer dataflow audit + path canaries |
 
 ---
 
@@ -214,10 +227,10 @@ one per operator move.
 |---|---|
 | [`README.md`](README.md) | This file — overview, quickstart, how it works |
 | [`AGENTS.md`](AGENTS.md) | The doctrine — identity and law |
-| [`commands/`](commands/) | 28 slash commands |
+| [`commands/`](commands/) | 33 slash commands |
 | [`skills/`](skills/) | 12 phase skills in SKILL.md format |
 | [`templates/`](templates/) | Engagement + report templates, Burp MCP config example |
-| [`tests/`](tests/) | 69 self-tests, all green |
+| [`tests/`](tests/) | 82 self-tests, all green |
 | [`SECURITY.md`](SECURITY.md) | Authorized-use posture |
 | [`LICENSE`](LICENSE) | MIT |
 
@@ -256,6 +269,7 @@ it. The reaper harvests what remains after.
 - [x] Hunt scaffold (scope.md + workspace) · ATT&CK Navigator export · report redaction
 - [x] Field-lesson hardening (HTB Cobblestone): encoded exfil, file fuzzing, canary listener, transport healthcheck, SQLi oracle self-test, magic variants, arsenal self-check, pure-python crackers, adaptive scan pacing, per-phase ledger checkpoints
 - [x] v1.2 strike extensions: token spray with authn/authz differential (401 auto-retry, 403-protocol-mismatch ≠ RBAC), kubelet WebSocket exec (v4/v5 channel framing) + canned pod→mount→remount→SSH chain, exec-contract probe (side-effect first, then source), literal payload discipline with verify flags + NSpid proof, `safe_kill` pkill guard, report merge, rack AST structural check + recon smoke test
+- [x] v1.3 identity + lifecycle overhaul: origin-bound transport with per-origin jars (targets are origins, not IP:ports), extensible spray surface registry (stateful web logins with CSRF + redirect classification, git hosts, databases, IMAP), sink contracts before payload construction, hypothesis budgets + tombstones, automatic fingerprint→advisory mapping (NVD/GHSA/searchsploit), gitmine blob-hash secret hunting, priv dataflow audit with path canaries, transport watchdog with re-validation
 - [ ] Built-in HTTP exploitation primitives (auth-bypass checks, verb tampering)
 - [ ] C2 module (implant wrappers, DNS channel templates)
 - [ ] AD attack-path planning with graph collection

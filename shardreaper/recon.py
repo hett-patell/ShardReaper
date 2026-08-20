@@ -461,10 +461,16 @@ def run_recon(scope, seeds, wordlist=None, ports=None, top_ports=100, workers=32
         http_ports = [p for p in open_ports
                       if p in HTTP_PORTS or (ports and p in ports)]
         target = {"host": host, "addrs": addrs, "ports": open_ports,
-                  "urls": [], "intel": {}, "findings": []}
+                  "urls": [], "origins": [], "intel": {}, "findings": []}
         for p in http_ports:
             scheme = "https" if p in (443, 8443, 5986, 10000) else "http"
             url = f"{scheme}://{host}:{p}"
+            # lesson 16: a target is an ORIGIN — record the scheme+host
+            # identity, not just the ip:port pair that probed it
+            from .http import origin_of
+            origin = origin_of(url)
+            if origin not in target["origins"]:
+                target["origins"].append(origin)
             probe = r.http_probe(url)
             target["urls"].append({"url": url, **{k: v for k, v in probe.items()
                                                   if k in ("status", "title", "server", "tech")}})

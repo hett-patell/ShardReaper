@@ -76,6 +76,10 @@ def main(argv=None):
     from . import spray as spraymod
     from . import k8s as k8smod
     from . import rackcheck as rackcheckmod
+    from . import sink as sinkmod
+    from . import hypothesis as hypmod
+    from . import gitmine as gitminemod
+    from . import priv as privmod
 
     engine.build_arg_parser(sub)
     reportmod.build_arg_parser(sub)
@@ -95,6 +99,10 @@ def main(argv=None):
     spraymod.build_arg_parser(sub)
     k8smod.build_arg_parser(sub)
     rackcheckmod.build_arg_parser(sub)
+    sinkmod.build_arg_parser(sub)
+    hypmod.build_arg_parser(sub)
+    gitminemod.build_arg_parser(sub)
+    privmod.build_arg_parser(sub)
 
     kb = sub.add_parser("kb", help="search the local offensive corpus")
     kb.add_argument("query", nargs="+")

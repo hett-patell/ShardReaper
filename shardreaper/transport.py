@@ -145,8 +145,152 @@ def cli_healthcheck(args):
     return 0
 
 
+# ---------------- transport watchdog (lesson 23) ----------------
+def revalidate_targets(eng, timeout=5, log=None):
+    """Target re-validation after an infrastructure event: does each host
+    still resolve, and do its known ports still answer? Returns a per-host
+    report — a redeploy to a new IP shows up as a changed surface, not as
+    a mystery."""
+    log = log or (lambda m: None)
+    out = {}
+    for t in eng.state.get("targets", []):
+        host = t.get("host") or ""
+        if not host:
+            continue
+        addrs = []
+        try:
+            old = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(min(timeout, 4))
+            try:
+                infos = socket.getaddrinfo(host, None)
+            finally:
+                socket.setdefaulttimeout(old)
+            addrs = list(dict.fromkeys(i[4][0] for i in infos))
+        except OSError:
+            pass
+        ports = {}
+        for p in sorted((t.get("ports") or {}).keys())[:12]:
+            ports[str(p)] = _tcp_probe(host, p, timeout=timeout)
+        urls = []
+        for u in t.get("urls", []):
+            url = u.get("url") or ""
+            if url:
+                urls.append(_probe_url(url, timeout=timeout))
+        rec = {"host": host, "addrs": addrs,
+               "ports_up": [p for p, ok in ports.items() if ok],
+               "ports_down": [p for p, ok in ports.items() if not ok],
+               "urls": [u for u in urls if u.get("status")],
+               "reached": bool(addrs) and any(ports.values())}
+        out[host] = rec
+        log(f"revalidate {host}: {len(addrs)} addr(s), "
+            f"{len(rec['ports_up'])}/{len(ports)} ports up, "
+            f"{len(rec['urls'])} url(s) answering")
+    return out
+
+
+def _probe_url(url, timeout=5):
+    from .http import OriginTransport
+    t = OriginTransport(timeout=timeout, insecure=True)
+    try:
+        r = t.request("GET", url, context="anon")
+        m = re.search(r"<title[^>]*>([^<]*)", r.get("body", ""), re.I)
+        return {"url": url, "status": r.get("status"),
+                "title": (m.group(1)[:60] if m else "")}
+    except OSError as e:
+        return {"url": url, "status": None, "error": str(e)[:80]}
+
+
+class Watchdog:
+    """Transport watchdog with auto-reconnect and target re-validation
+    (lesson 23): VPN drops and target redeploys are ASSUMED, not hoped
+    away. On a failed round: run the operator's reconnect command, then
+    re-validate every known target so a redeploy costs chain RE-EXECUTION,
+    not re-discovery."""
+
+    def __init__(self, eng=None, reconnect=None, interval=30, timeout=5,
+                 log=None):
+        self.eng = eng
+        self.reconnect = reconnect
+        self.interval = interval
+        self.timeout = timeout
+        self.log = log or (lambda m: None)
+        self.rounds = 0
+        self.reconnects = 0
+
+    def round(self):
+        self.rounds += 1
+        report = healthcheck()
+        reasons = []
+        if not report["vpn_processes"] and not report["tun_present"]:
+            reasons.append("no tunnel")
+        if report["gateway"] and not (report["gateway_tcp"]
+                                      or report["gateway_tcp22"]):
+            reasons.append("gateway down")
+        if not report["dns"]:
+            reasons.append("dns down")
+        healthy = not reasons
+        verdict = "; ".join(reasons)
+        revalidated = None
+        if not healthy and self.reconnect:
+            self.reconnects += 1
+            self.log(f"watchdog round {self.rounds}: transport DOWN "
+                     f"({verdict}) — reconnecting: {self.reconnect}")
+            try:
+                subprocess.run(["sh", "-c", self.reconnect],
+                               capture_output=True, text=True, timeout=60)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                self.log(f"watchdog: reconnect failed: {e}")
+        if not healthy and self.eng is not None:
+            self.log(f"watchdog round {self.rounds}: re-validating targets")
+            revalidated = revalidate_targets(self.eng, timeout=self.timeout,
+                                             log=self.log)
+        return {"round": self.rounds, "healthy": healthy,
+                "verdict": verdict,
+                "reconnect_ran": not healthy and bool(self.reconnect),
+                "revalidated": revalidated}
+
+    def run(self, rounds=None, once=False):
+        import time as _time
+        while True:
+            result = self.round()
+            if once or (rounds is not None and self.rounds >= rounds):
+                return result
+            _time.sleep(self.interval)
+
+
+def cli_watchdog(args):
+    from .state import Engagement
+    base = os.path.abspath(args.dir)
+    eng = None
+    if os.path.isfile(os.path.join(base, "state.json")):
+        eng = Engagement.load(base)
+    else:
+        print(f"no engagement at {base} — revalidation disabled, "
+              f"transport-only watchdog")
+    w = Watchdog(eng=eng, reconnect=args.reconnect, interval=args.interval,
+                 timeout=args.timeout, log=lambda m: print(f"[watchdog] {m}"))
+    result = w.run(rounds=args.rounds, once=args.once)
+    print(f"watchdog stopped after {result['round']} round(s) — "
+          f"{'transport UP' if result['healthy'] else 'transport DOWN: ' + result['verdict']}"
+          f", reconnects: {w.reconnects}")
+    return 0 if result["healthy"] else 1
+
+
 def build_arg_parser(sub):
     p = sub.add_parser("healthcheck", help="own-side transport self-check: "
                         "vpn process, tunnel, gateway, dns (lesson 4)")
     p.set_defaults(fn=cli_healthcheck)
+
+    w = sub.add_parser("watchdog", help="transport watchdog: auto-reconnect "
+                       "on tunnel failure + target re-validation (lesson 23)")
+    w.add_argument("dir", help="engagement folder (for target re-validation)")
+    w.add_argument("--reconnect", default=None,
+                   help="reconnect command, e.g. 'systemctl restart openvpn@lab'")
+    w.add_argument("--interval", type=float, default=30,
+                   help="seconds between rounds")
+    w.add_argument("--rounds", type=int, default=None,
+                   help="stop after N rounds")
+    w.add_argument("--once", action="store_true", help="single round")
+    w.add_argument("--timeout", type=float, default=5)
+    w.set_defaults(fn=cli_watchdog)
     return p

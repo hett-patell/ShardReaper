@@ -42,6 +42,10 @@ class Engagement:
             "targets": [],          # discovered live hosts
             "findings": [],         # confirmed findings
             "credentials": [],      # harvested credentials (token spray feed)
+            "hypotheses": [],       # tracked theories: budget/cutoff/tombstones
+            "sink_contracts": [],   # proven render/exec paths before payloads
+            "advisories": [],       # fingerprint -> CVE/advisory mapping
+            "login_forms": [],      # discovered stateful web login surfaces
             "intel": {},            # per-host intel
             "plan": [],             # attack plan items
             "actions": [],          # executed techniques

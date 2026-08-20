@@ -152,3 +152,57 @@ These are LAW, not advice. Each is enforced by tooling where possible:
     inside module functions) and the test suite carries a live recon smoke
     test. (Enforced: `payload.safe_kill`, atomics execution gate,
     `shardreaper rack-check`.)
+16. **A target is an origin, not an IP:port.** Virtual-hosted HTTP targets
+    route on Host and pin cookies to a domain; a client that talks to an IP
+    with a Host header silently drops sessions and poisons jars. Every HTTP
+    primitive must take a full origin URL and resolve DNS/IP itself
+    (`--resolve` semantics), keep one cookie jar PER origin, and never mix
+    anonymous and authenticated traffic in the same jar. (Enforced:
+    `http.transport` origin-bound sessions; `recon` emits origins, not
+    ip:port pairs.)
+17. **Every auth surface type is sprayable; the list is extensible, not
+    closed.** Held credentials must be sprayable against SSH, basic auth,
+    bearer APIs, cookies AND stateful web logins (CSRF token extraction +
+    redirect classification), git hosts, databases, IMAP — any surface that
+    takes a credential. Classify the response (200/302-target/403-body/401),
+    never the transport. (Enforced: `spray.web_login`,
+    `spray.classify_response` surface registry.)
+18. **Sink contract before payload.** For any injection class (template,
+    SSTI, deserialization, upload), prove the execution contract with the
+    cheapest oracle first: read the render/exec path from public source when
+    available, else send a self-test marker (`{{7*7}}`, magic strings) and
+    look for the side effect. No exploit construction before the oracle
+    answers. (Enforced: `analyze` requires a sink-contract record per
+    injection theory.)
+19. **Hypotheses have kill-criteria, not enthusiasm.** Every theory gets a
+    probe budget and a no-evidence cutoff; when it dies, the ledger records
+    WHY so it is not resurrected. A running hypothesis costs the engagement
+    its most scarce resource: the next pivot. (Enforced: `run` phase ledger
+    tracks hypothesis lifecycle; dead theories are tombstoned.)
+20. **Known-software CVEs are recon data, not memory exercises.** The
+    moment a fingerprint resolves (product + version + banner), map it to
+    public advisories (NVD/opencve/GHSA/exploit-db) and treat the top hits
+    as ordered attack candidates. Vendor/vuln sources are legal; box
+    writeups are not — the boundary is the software, not the target.
+    (Enforced: `osint --product` wired into the analyze phase.)
+21. **Git hosts are secret mines.** For any git surface (Gitea/GitLab/
+    GitHub/Bitbucket): enumerate users/orgs/repos via API, diff commit
+    history, and hunt redacted/removed secrets — always via blob hashes
+    (raw endpoints often ignore refs). Deleted secrets in history are the
+    highest-yield gift a box gives. (Enforced: `gitmine` module: trees,
+    blobs, commit-diff, secret diffing.)
+22. **Privileged consumers of attacker-influenceable input are the
+    universal Linux root path.** Any root-run periodic task (cron, systemd
+    timer, CI, git hook, log processor, file watcher) that reads data an
+    attacker can influence — repo content, filenames, config, uploads — is a
+    candidate for path-join bugs, command construction bugs, and
+    filename/path escapes (absolute paths, `..`, separators). Enumerate the
+    timers, trace their inputs, test the path contract with canary names.
+    (Enforced: `priv` module: timers/cron inventory + input-source tracing +
+    path-escape canaries.)
+23. **Infrastructure churn is assumed, not hoped away.** VPN drops,
+    targets get redeployed to new IPs, sessions die mid-chain. Keep a
+    transport watchdog with auto-reconnect, re-validate the target on
+    failure, checkpoint state after every phase so a redeploy costs
+    re-execution of the chain, not re-discovery of it. (Enforced:
+    `healthcheck` watchdog loop; `engage` checkpoints per phase.)

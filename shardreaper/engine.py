@@ -105,10 +105,17 @@ class Engine:
     def phase_recon(self):
         self.eng.set_phase("recon")
         if self.mock:
-            self.eng.state["targets"] = [
-                {"host": "localhost", "addrs": ["127.0.0.1"], "ports": {80: None},
-                 "urls": [{"url": s, "status": 200, "title": "mock", "tech": []}],
-                 "intel": {}, "findings": []} for s in self.scope.seeds]
+            from urllib.parse import urlparse
+            targets = []
+            for s in self.scope.seeds:
+                host = urlparse(s if "://" in s else "//" + s).hostname or s
+                targets.append({
+                    "host": host, "addrs": ["127.0.0.1"],
+                    "ports": {80: None},
+                    "urls": [{"url": s, "status": 200, "title": "mock",
+                              "tech": []}],
+                    "origins": [s], "intel": {}, "findings": []})
+            self.eng.state["targets"] = targets
             self.eng.save()
             self.eng.log(f"recon(mock): {len(self.eng.state['targets'])} target(s)")
             return
@@ -139,6 +146,48 @@ class Engine:
                 t["intel"]["kb"] += self.kb_hits(f_.get("detail", "")[:80], limit=2)
             t["intel"]["kb"] = list(dict.fromkeys(t["intel"]["kb"]))[:8]
             self.eng.log(f"analyze {host}: hints={hints[:8]}", "action")
+        # lesson 20: fingerprint -> advisory mapping is an automatic step
+        try:
+            from .analysis import advisory_map
+            offline = bool(os.environ.get("SHARDREAPER_OFFLINE"))
+            advisory_map(self.eng, log=self.eng.log,
+                         offline=offline or self.mock)
+        except Exception as e:
+            self.eng.log(f"advisory map skipped: {e}", "warn")
+        # lesson 18: every injection theory gets a sink-contract record —
+        # unverified until the cheapest oracle answers; the attack gate
+        # refuses payload construction without a proven contract
+        try:
+            from .sink import new_contract
+            sink_hints = {
+                "ssti": ("ssti", "template"), "template": ("template",),
+                "jinja": ("ssti", "template"), "twig": ("template",),
+                "deserial": ("deser",), "unserialize": ("deser",),
+            }
+            existing = {(c.get("kind"), c.get("sink"))
+                        for c in self.eng.state.get("sink_contracts", [])}
+            for t in self.eng.state["targets"]:
+                hint_words = list((t.get("intel") or {}).get("hints") or [])
+                for u in t.get("urls", []):
+                    tv = u.get("tech") or []
+                    if isinstance(tv, str):
+                        tv = [tv]
+                    hint_words += tv
+                hints = " ".join(hint_words)
+                for marker, kinds in sink_hints.items():
+                    if marker in hints.lower():
+                        for kind in kinds:
+                            if (kind, t["host"]) not in existing:
+                                new_contract(self.eng, kind, t["host"],
+                                             oracle="unset", status="unverified",
+                                             reason="fingerprint hints at this "
+                                             "sink — run `shardreaper sink` or "
+                                             "read the render source first")
+                                self.eng.log(f"sink contract {kind} @ "
+                                             f"{t['host']}: unverified — no "
+                                             f"payload until proven", "warn")
+        except Exception as e:
+            self.eng.log(f"sink contract pass skipped: {e}", "warn")
         self.eng.save()
 
     def phase_plan(self):
@@ -229,6 +278,21 @@ class Engine:
             if not self.scope.in_scope_host(target):
                 self.eng.log(f"skip {target}: out of scope", "warn")
                 continue
+            # lesson 19: every theory is tracked — a tombstoned theory is
+            # never resurrected, and the refusal cites the recorded reason
+            try:
+                from . import hypothesis
+                theory = f"{target}::{item['action']}"
+                reason = hypothesis.tombstoned(target, theory)
+                if reason:
+                    self.eng.log(f"skip {theory}: TOMBSTONED — {reason}", "warn")
+                    continue
+                h = hypothesis.new_hypothesis(
+                    self.eng, theory, host=target,
+                    budget=item.get("budget", 3),
+                    cutoff=item.get("cutoff", 3), detail=item["detail"])
+            except Exception:
+                h = None
             self.eng.log(f"attack {target} — {item['action']} ({item['detail'][:80]})",
                          "action")
             if item.get("atomic"):
@@ -252,6 +316,23 @@ class Engine:
                     else:
                         self.eng.log(f"  [{at['technique']}] rc={r.get('returncode')} "
                                      f"{r.get('stdout', r.get('error', ''))[:100]}", "action")
+                    # lesson 19 lifecycle: evidence extends the runway,
+                    # a REAL probe without evidence spends budget + cutoff.
+                    # A dry-run is not a probe — the budget is untouched.
+                    if not r.get("dry_run"):
+                        try:
+                            if r.get("ok"):
+                                hypothesis.note_evidence(
+                                    self.eng, h["id"],
+                                    f"{at['technique']} rc={r.get('returncode')} "
+                                    f"{(r.get('stdout') or '')[:120]}")
+                            else:
+                                hypothesis.probe_failed(
+                                    self.eng, h["id"],
+                                    note=f"{at['technique']} {at['name']} "
+                                         f"rc={r.get('returncode')}")
+                        except Exception:
+                            pass
                     # negative memory: tried without a confirmed finding — never re-waste it
                     if r.get("dry_run") or not r.get("ok"):
                         try:
@@ -291,21 +372,32 @@ class Engine:
         self.eng.save()
 
     def phase_spray(self):
-        """Token spray (lesson 11): every held credential automatically
+        """Token spray (lessons 11+17): every held credential automatically
         fired against every authenticated surface on the box — kubelet,
-        apiserver, registry, SSH, docker socket, discovered HTTP — with all
-        protocol variants. The kubelet miss is the canonical case this
-        phase exists to kill."""
+        apiserver, registry, SSH, docker socket, stateful web logins (CSRF),
+        git hosts, basic-auth APIs, databases, IMAP — with all protocol
+        variants. The kubelet miss is the canonical case this phase exists
+        to kill."""
         self.eng.set_phase("spray")
-        from .spray import load_credentials, spray, hit_severity
+        from .spray import (load_credentials, spray, hit_severity,
+                            discover_login_forms)
+        from .http import OriginTransport
         creds = load_credentials(self.eng)
         if not creds:
             self.eng.log("spray: no held credentials — harvest first, then "
                          "re-run this phase", "warn")
             return
+        transport = OriginTransport(timeout=10, insecure=True)
+        # lesson 17: stateful web logins are surfaces — discover them first
+        try:
+            if not self.mock:
+                discover_login_forms(self.eng, transport, log=self.eng.log)
+        except Exception:
+            pass
         self.eng.log(f"spray: {len(creds)} held credential(s) — firing against "
                      f"every authenticated surface", "action")
-        result = spray(self.eng, creds, log=self.eng.log, ssh=not self.mock)
+        result = spray(self.eng, creds, log=self.eng.log, ssh=not self.mock,
+                       transport=transport)
         self.eng.state["spray"] = result
         for hit in result.get("hits", []):
             cred = hit.get("credential") or "unauthenticated"
@@ -320,7 +412,7 @@ class Engine:
                                 evidence=[hit.get("label", "")[:160]])
             key = [hit["surface"], cred]
             if key not in self.eng.state.setdefault("spray_findings", []):
-                self.eng.state["spray_findings"].add(key)
+                self.eng.state["spray_findings"].append(key)
                 self.eng.add_finding(
                     f"valid credential on {hit['surface']}", sev,
                     "credential-valid", technique, hit["surface"],
