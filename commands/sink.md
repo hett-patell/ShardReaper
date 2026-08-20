@@ -12,8 +12,9 @@ oracle must answer first:
    entrypoint. A raw-string/escape path DISQUALIFIES the sink; a
    render_template/eval/unserialize path PROVES it. Source evidence
    outranks every black-box guess.
-2. **Marker self-test** — `{{7*7}}` → expect `49` (and the per-kind marker
-   table: `${7*7}`, `#{7*7}`, `<%= 7*7 %>`, magic strings).
+2. **Marker self-test** — `{7*7}`-style template probe → expect `49` (and
+   the per-kind marker table: `${7*7}`, `#{7*7}`, `<%= 7*7 %>`, magic
+   strings).
 
 ## Usage
 

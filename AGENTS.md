@@ -170,7 +170,8 @@ These are LAW, not advice. Each is enforced by tooling where possible:
 18. **Sink contract before payload.** For any injection class (template,
     SSTI, deserialization, upload), prove the execution contract with the
     cheapest oracle first: read the render/exec path from public source when
-    available, else send a self-test marker (`{{7*7}}`, magic strings) and
+    available, else send a self-test marker (a `{7*7}` template probe, magic
+    strings) and
     look for the side effect. No exploit construction before the oracle
     answers. (Enforced: `analyze` requires a sink-contract record per
     injection theory.)
