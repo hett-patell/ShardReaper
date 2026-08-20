@@ -5,4 +5,4 @@ ired.team, BugHunter, tool catalogs), engages authorized targets through a
 deterministic phase engine, and produces operator-ready reports.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"

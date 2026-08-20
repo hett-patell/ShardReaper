@@ -80,6 +80,7 @@ def main(argv=None):
     from . import hypothesis as hypmod
     from . import gitmine as gitminemod
     from . import priv as privmod
+    from . import webattack as webattackmod
 
     engine.build_arg_parser(sub)
     reportmod.build_arg_parser(sub)
@@ -103,6 +104,7 @@ def main(argv=None):
     hypmod.build_arg_parser(sub)
     gitminemod.build_arg_parser(sub)
     privmod.build_arg_parser(sub)
+    webattackmod.build_arg_parser(sub)
 
     kb = sub.add_parser("kb", help="search the local offensive corpus")
     kb.add_argument("query", nargs="+")

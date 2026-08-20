@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 # ATT&CK-style phase order the engine walks
 PHASES = [
-    "engage", "recon", "analyze", "plan", "attack",
+    "engage", "recon", "analyze", "plan", "attack", "webattack",
     "escalate", "persist", "move", "harvest", "spray",
     "evade", "exfil", "report",
 ]

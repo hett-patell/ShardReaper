@@ -1341,6 +1341,273 @@ def test_watchdog_revalidate_targets():
         srv.shutdown()
         srv.server_close()
 
+# ---------------- webattack (HTTP exploit primitives) ----------------
+class _FakeTransport:
+    """Deterministic transport stub — records calls, serves canned rules."""
+    def __init__(self, behavior):
+        self.behavior = behavior
+        self.calls = []
+
+    def request(self, method, url, headers=None, body=None, context="anon",
+                follow=0, insecure=None, host_header=None):
+        self.calls.append((method, url, headers or {}, context, host_header))
+        return self.behavior(method, url, headers or {}, context, host_header)
+
+
+def _resp(status, body="", headers=None):
+    return {"status": status, "headers": headers or {}, "set_cookies": [],
+            "body": body, "raw": body.encode(), "origin": "http://t.internal",
+            "context": "anon"}
+
+
+def test_webattack_differs():
+    from shardreaper.webattack import differs, similarity, fingerprint
+    assert differs(fingerprint(_resp(403, "no")),
+                   fingerprint(_resp(200, "yes yes yes")))
+    assert not differs(fingerprint(_resp(200, "a" * 100)),
+                       fingerprint(_resp(200, "a" * 95)))
+    assert differs(fingerprint(_resp(200, "a" * 100)),
+                   fingerprint(_resp(200, "a" * 10)))
+    assert similarity("abcdef", "abcdef") == 1.0
+    assert similarity("aaaaaa", "zzzzzz") < 0.5
+
+
+def test_webattack_auth_bypass_matrix():
+    from shardreaper.webattack import auth_bypass_matrix
+    def behavior(method, url, headers, context, host_header):
+        if headers.get("X-Original-URL"):
+            return _resp(200, "admin panel secrets " * 10)
+        if url.endswith("//admin"):
+            return _resp(200, "admin panel secrets " * 10)
+        return _resp(403, "denied")
+    res = auth_bypass_matrix(_FakeTransport(behavior), "http://t.internal/admin")
+    assert res["baseline"]["status"] == 403
+    muts = [h["mutation"] for h in res["hits"]]
+    assert any("X-Original-URL" in m for m in muts)
+    assert any("//admin" in m for m in muts)
+    # a 200 baseline must never fire the matrix
+    res2 = auth_bypass_matrix(_FakeTransport(
+        lambda *a, **k: _resp(200, "open")), "http://t.internal/")
+    assert res2["hits"] == [] and "no bypass needed" in res2["note"]
+
+
+def test_webattack_verb_tamper():
+    from shardreaper.webattack import verb_tamper
+    def behavior(method, url, headers, context, host_header):
+        if method == "PUT":
+            return _resp(200, "created " + "x" * 300)
+        if method == "OPTIONS":
+            return _resp(200, "", {"allow": "GET, PUT, DELETE"})
+        if method == "TRACE":
+            return _resp(200, "TRACE / HTTP/1.1\nHost: t.internal")
+        return _resp(403, "no")
+    res = verb_tamper(_FakeTransport(behavior), "http://t.internal/api/item")
+    assert any(h["mutation"] == "PUT" for h in res["hits"])
+    assert any("dangerous verbs" in h["evidence"] for h in res["hits"])
+    assert any("cross-site tracing" in h["evidence"] for h in res["hits"])
+
+
+def test_webattack_idor_context_differential():
+    from shardreaper.webattack import idor_differential
+    doc = "<html>profile: ssn 123-45-6789</html>" + "x" * 200
+    def behavior(method, url, headers, context, host_header):
+        return _resp(200, doc)   # the bug: anon gets the same body
+    res = idor_differential(_FakeTransport(behavior),
+                            "http://t.internal/profile",
+                            contexts=("anon", "user:victim"))
+    assert any("anon ==" in h["mutation"] for h in res["hits"])
+
+
+def test_webattack_idor_swing():
+    from shardreaper.webattack import idor_differential
+    import re as _re
+    def behavior(method, url, headers, context, host_header):
+        m = _re.search(r"/doc/(\d+)", url)
+        if m:
+            i = m.group(1)
+            return _resp(200, f"document {i}: " + i * 120)
+        return _resp(404, "")
+    res = idor_differential(_FakeTransport(behavior),
+                            "http://t.internal/doc/41",
+                            contexts=("user:victim",))
+    assert any("id swing" in h["mutation"] for h in res["hits"])
+
+
+def test_webattack_host_header():
+    from shardreaper.webattack import host_header_injection
+    def behavior(method, url, headers, context, host_header):
+        if host_header and host_header.endswith(".invalid"):
+            return _resp(200, f'<a href="http://{host_header}/reset">reset</a>')
+        return _resp(200, "plain page")
+    res = host_header_injection(_FakeTransport(behavior),
+                                "http://t.internal/login",
+                                canary="sr-test.invalid")
+    assert any("body" in h["evidence"] for h in res["hits"])
+    # no reflection, no finding
+    res2 = host_header_injection(_FakeTransport(
+        lambda *a, **k: _resp(200, "plain")), "http://t.internal/login",
+        canary="sr-test.invalid")
+    assert res2["hits"] == []
+
+
+def test_webattack_hpp():
+    from shardreaper.webattack import hpp_probe
+    def behavior(method, url, headers, context, host_header):
+        if url.count("q=") > 1:
+            return _resp(200, "STACK TRACE " + "x" * 300)
+        return _resp(200, "ok")
+    res = hpp_probe(_FakeTransport(behavior), "http://t.internal/s?q=1")
+    assert any("q" in h["mutation"] for h in res["hits"])
+    # no query params -> no probes at all
+    res2 = hpp_probe(_FakeTransport(behavior), "http://t.internal/s")
+    assert res2["probes"] == 0 and res2["hits"] == []
+
+
+def _make_hs256_token(secret, header=None, payload=None):
+    import base64, hashlib, hmac as _hmac, json as _json
+    def b64(o):
+        return base64.urlsafe_b64encode(_json.dumps(o).encode()).rstrip(b"=").decode()
+    h = header or {"alg": "HS256", "typ": "JWT"}
+    p = payload or {"sub": "admin", "role": "admin"}
+    si = b64(h) + "." + b64(p)
+    sig = base64.urlsafe_b64encode(
+        _hmac.new(secret.encode(), si.encode(), hashlib.sha256).digest()
+    ).rstrip(b"=").decode()
+    return f"{si}.{sig}"
+
+
+def test_jwt_audit_and_forge():
+    from shardreaper import webattack
+    tok = _make_hs256_token("secret")
+    audit = webattack.jwt_audit(tok)
+    assert audit["valid"] and audit["alg"] == "HS256"
+    flags = {f["flag"]: f for f in audit["flags"]}
+    assert "weak-secret" in flags and flags["weak-secret"]["secret"] == "secret"
+    assert "no-expiry" in flags
+    # alg=none forgeries: 4 casings x (empty sig + dropped sig)
+    forged = webattack.jwt_forge_none(tok)
+    assert len(forged) == 8
+    h, p, sig = webattack.jwt_split(forged[0])
+    assert h["alg"] == "none" and p["sub"] == "admin" and sig == ""
+    # strong secret: no weak-secret flag
+    audit2 = webattack.jwt_audit(_make_hs256_token(os.urandom(32).hex()))
+    assert not any(f["flag"] == "weak-secret" for f in audit2["flags"])
+    # garbage in, clean error out
+    assert not webattack.jwt_audit("not-a-jwt")["valid"]
+
+
+def test_jwt_rs256_confusion():
+    from shardreaper import webattack
+    import hashlib, hmac as _hmac, base64
+    tok = _make_hs256_token("whatever",
+                            header={"alg": "RS256", "typ": "JWT"})
+    pub = "-----BEGIN PUBLIC KEY-----\nMIIB...\n-----END PUBLIC KEY-----"
+    forged = webattack.jwt_rs256_to_hs256(tok, pub)
+    h, p, sig = webattack.jwt_split(forged)
+    assert h["alg"] == "HS256"
+    si = ".".join(forged.split(".")[:2])
+    expect = base64.urlsafe_b64encode(
+        _hmac.new(pub.encode(), si.encode(), hashlib.sha256).digest()
+    ).rstrip(b"=").decode()
+    assert sig == expect
+
+
+def test_webattack_phase_dry_run():
+    from shardreaper.engine import engage, Engine
+    with tempfile.TemporaryDirectory() as d:
+        base = os.path.join(d, "eng")
+        engage(base, "wa-dry", ["http://t.internal"], ["t.internal"], [],
+               "obj", mock=True)
+        eng = Engagement.load(base)
+        eng.state["targets"] = [{"host": "t.internal", "ports": {},
+                                 "urls": [{"url": "http://t.internal/admin",
+                                           "status": 403},
+                                          {"url": "http://t.internal/s?q=1",
+                                           "status": 200}],
+                                 "intel": {}, "findings": []}]
+        eng.save()
+        e = Engine(base, phases=["webattack"], go=False, mock=True)
+        e.run()
+        plans = [n for n in e.eng.state["notes"]
+                 if n.get("kind") == "webattack-plan"]
+        assert plans, "dry-run must record the probe matrix"
+        fams = {f for item in plans[0]["data"] for f in item["families"]}
+        assert "auth-bypass" in fams and "verb-tamper" in fams
+        assert not e.eng.state["findings"], "dry-run fires nothing"
+
+
+def test_webattack_phase_go_finds_bypass():
+    from shardreaper.engine import engage, Engine
+    import shardreaper.http as http_mod
+    def behavior(method, url, headers, context, host_header):
+        if headers.get("X-Original-URL"):
+            return _resp(200, "admin panel secrets " * 10)
+        return _resp(403, "denied")
+    fake = _FakeTransport(behavior)
+    orig = http_mod.OriginTransport
+    http_mod.OriginTransport = lambda *a, **k: fake
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            base = os.path.join(d, "eng")
+            engage(base, "wa-go", ["http://t.internal"], ["t.internal"], [],
+                   "obj", mock=True)
+            eng = Engagement.load(base)
+            eng.state["targets"] = [{"host": "t.internal", "ports": {},
+                                     "urls": [{"url": "http://t.internal/admin",
+                                               "status": 403}],
+                                     "intel": {}, "findings": []}]
+            eng.save()
+            e = Engine(base, phases=["webattack"], go=True, mock=False)
+            e.run()
+            crit = [f for f in e.eng.state["findings"]
+                    if f["class"] == "auth-bypass"]
+            assert crit and crit[0]["severity"] == "critical"
+            assert "X-Original-URL" in crit[0]["evidence"][0]
+    finally:
+        http_mod.OriginTransport = orig
+
+
+def test_http_transport_body_framing():
+    """Live-socket regression: bodies must survive EOF-delimited (no
+    Content-Length, HTTP/1.0 style) and chunked transfer framing — a
+    truncated body is a broken oracle downstream."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from shardreaper.http import OriginTransport
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"   # no keep-alive, close delimits
+        def do_GET(self):
+            if self.path == "/eof":
+                body = b"document body that must survive" * 10
+                self.send_response(200)  # no Content-Length header
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/chunked":
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for piece in (b"first-", b"second-", b"third"):
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(piece), piece))
+                self.wfile.write(b"0\r\n\r\n")
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        t = OriginTransport(timeout=3)
+        r = t.request("GET", f"http://127.0.0.1:{port}/eof")
+        assert r["status"] == 200 and r["body"].endswith("survive")
+        assert len(r["body"]) == len("document body that must survive" * 10)
+        r2 = t.request("GET", f"http://127.0.0.1:{port}/chunked")
+        assert r2["body"] == "first-second-third"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 if __name__ == "__main__":
     import traceback
     failed = 0

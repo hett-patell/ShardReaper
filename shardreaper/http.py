@@ -119,6 +119,33 @@ def _host_matches(host, domain):
     return host.endswith("." + domain)
 
 
+def _dechunk(sock, buf):
+    """Decode a chunked transfer body. `buf` may already hold some (or all)
+    chunks past the header terminator; reads from the socket as needed."""
+    out = b""
+    data = buf
+    while True:
+        while b"\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return out
+            data += chunk
+        line, _, data = data.partition(b"\r\n")
+        try:
+            size = int(line.split(b";", 1)[0].strip(), 16)
+        except ValueError:
+            return out
+        if size == 0:
+            return out
+        while len(data) < size + 2:      # chunk data + trailing CRLF
+            chunk = sock.recv(4096)
+            if not chunk:
+                return out
+            data += chunk
+        out += data[:size]
+        data = data[size + 2:]
+
+
 class OriginTransport:
     """Origin-bound HTTP client: resolve here, Host from the origin,
     per-(origin, context) cookie jars."""
@@ -223,14 +250,32 @@ class OriginTransport:
                     resp_headers[k] = v
             if set_cookies:
                 jar.add(set_cookies, host, u.path or "/")
-            # content-length read (Connection: close keeps this simple)
-            length = int(resp_headers.get("content-length", "0") or "0")
-            payload = rest
-            while length and len(payload) < length:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                payload += chunk
+            # body framing, in protocol order:
+            # 1. Transfer-Encoding: chunked -> de-chunk (dev servers, flask)
+            # 2. Content-Length -> read exactly that many bytes
+            # 3. neither -> we sent Connection: close, so EOF delimits the
+            #    body. Reading nothing here silently truncates every HTTP/1.0
+            #    and embedded-device response — a broken oracle downstream.
+            if "chunked" in (resp_headers.get("transfer-encoding", "")
+                             .lower()):
+                payload = _dechunk(sock, rest)
+            else:
+                length_hdr = resp_headers.get("content-length")
+                if length_hdr is not None:
+                    length = int(length_hdr or "0")
+                    payload = rest
+                    while len(payload) < length:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        payload += chunk
+                else:
+                    payload = rest
+                    while True:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        payload += chunk
             out = {"status": status, "headers": resp_headers,
                    "set_cookies": set_cookies,
                    "body": payload.decode("utf-8", "ignore"),
